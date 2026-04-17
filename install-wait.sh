@@ -1,30 +1,18 @@
 #!/bin/bash
 
-# Color definitions for terminal output
+# ============================================================
+#  Wait Monitor — Installer & Manager
+# ============================================================
+
+# ── Color definitions ──────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-NC='\033[0m' # No Color
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
 
-# Logging functions
-log_info() {
-    echo -e "$1"
-}
-
-log_success() {
-    echo -e "${GREEN}$1${NC}"
-}
-
-log_error() {
-    echo -e "${RED}$1${NC}"
-}
-
-log_step() {
-    echo -e "${YELLOW}$1${NC}"
-}
-
-
-# Global variables
+# ── Global variables ───────────────────────────────────────
 INSTALL_DIR="/opt/wait-monitor"
 DATA_DIR="/opt/wait-monitor"
 SERVICE_NAME="wait-monitor"
@@ -35,197 +23,218 @@ REPO_OWNER="nimeng1222"
 REPO_NAME="wait-monitor"
 DEFAULT_RELEASE_REPO_URL="https://github.com/nimeng1222/wait-release/releases"
 RELEASE_REPO_URL="${WAIT_MAIN_RELEASE_REPO_URL:-$DEFAULT_RELEASE_REPO_URL}"
+VERSION="v0.1.15"
 
-# Show banner
+# ── Logging helpers ────────────────────────────────────────
+info()    { echo -e "${NC}$1${NC}"; }
+ok()      { echo -e "${GREEN}  ✓  $1${NC}"; }
+warn()    { echo -e "${YELLOW}  ⚠  $1${NC}"; }
+err()     { echo -e "${RED}  ✗  $1${NC}"; }
+step()    { echo -e "${CYAN}${BOLD}▸${NC} ${BOLD}$1${NC}"; }
+divider() { echo -e "${CYAN}──────────────────────────────────────────────────────${NC}"; }
+
+# ── Spinner for long-running tasks ─────────────────────────
+spinner() {
+    local pid=$1
+    local msg=$2
+    local spin='⣾⣽⣻⢿⡿⣟⣯⣷'
+    local i=0
+    while kill -0 "$pid" 2>/dev/null; do
+        i=$(( (i+1) % 8 ))
+        printf "\r  ${CYAN}${spin:$i:1}${NC}  $msg"
+        sleep 0.1
+    done
+    wait "$pid"
+    local ret=$?
+    printf "\r"
+    return $ret
+}
+
+# ── Banner ─────────────────────────────────────────────────
 show_banner() {
     clear
-    echo "=============================================================="
-    echo "            Wait Monitor Installer"
-    echo "       ${RELEASE_REPO_URL}"
-    echo "=============================================================="
+    echo
+    echo -e "${CYAN}${BOLD}"
+    echo "   ██╗    ██╗███████╗██╗      ██████╗ ██████╗ ██████╗ ███████╗██████╗ "
+    echo "   ██║    ██║██╔════╝██║     ██╔═══██╗██╔══██╗██╔══██╗██╔════╝██╔══██╗"
+    echo "   ██║ █╗ ██║█████╗  ██║     ██║   ██║██████╔╝██║  ██║█████╗  ██████╔╝"
+    echo "   ██║███╗██║██╔══╝  ██║     ██║   ██║██╔═══╝ ██║  ██║██╔══╝  ██╔══██╗"
+    echo "   ╚███╔███╔╝███████╗███████╗╚██████╔╝██║     ██████╔╝███████╗██║  ██║"
+    echo "    ╚══╝╚══╝ ╚══════╝╚══════╝ ╚═════╝ ╚═╝     ╚═════╝ ╚══════╝╚═╝  ╚═╝"
+    echo
+    echo -e "   ${GREEN}${BOLD}Infrastructure Monitor  •  ${VERSION}${NC}"
+    echo
+    divider
     echo
 }
 
-# Check if running as root
+# ── Root & systemd checks ──────────────────────────────────
 check_root() {
     if [ "$EUID" -ne 0 ]; then
-        log_error "请使用 root 权限运行此脚本"
+        err "请使用 root 权限运行此脚本"
+        echo
         exit 1
     fi
 }
 
-# Check for systemd
 check_systemd() {
-    if ! command -v systemctl >/dev/null 2>&1; then
-        return 1
-    else
-        return 0
-    fi
+    command -v systemctl >/dev/null 2>&1
 }
 
-# Detect system architecture
+# ── Architecture detection ─────────────────────────────────
 detect_arch() {
     local arch=$(uname -m)
     case $arch in
-        x86_64)
-            echo "amd64"
-            ;;
-        aarch64)
-            echo "arm64"
-            ;;
-        i386|i686)
-            echo "386"
-            ;;
-        riscv64)
-            echo "riscv64"
-            ;;
-        *)
-            log_error "不支持的架构: $arch"
-            exit 1
-            ;;
+        x86_64)  echo "amd64" ;;
+        aarch64) echo "arm64" ;;
+        i386|i686) echo "386" ;;
+        riscv64) echo "riscv64" ;;
+        *) err "不支持的架构: $arch"; exit 1 ;;
     esac
 }
 
-# Check if wait is already installed
+# ── Install state ──────────────────────────────────────────
 is_installed() {
-    if [ -f "$BINARY_PATH" ]; then
-        return 0 # 0 means true in bash exit codes
-    else
-        return 1 # 1 means false
-    fi
+    [ -f "$BINARY_PATH" ]
 }
 
-# Install dependencies
+# ── Dependencies ───────────────────────────────────────────
 install_dependencies() {
-    log_step "检查并安装依赖..."
+    if command -v curl >/dev/null 2>&1; then
+        return
+    fi
 
-    if ! command -v curl >/dev/null 2>&1; then
-        if command -v apt >/dev/null 2>&1; then
-            log_info "使用 apt 安装依赖..."
-            apt update
-            apt install -y curl
-        elif command -v yum >/dev/null 2>&1; then
-            log_info "使用 yum 安装依赖..."
-            yum install -y curl
-        elif command -v apk >/dev/null 2>&1; then
-            log_info "使用 apk 安装依赖..."
-            apk add curl
-        else
-            log_error "未找到支持的包管理器 (apt/yum/apk)"
-            exit 1
-        fi
+    step "安装 curl 依赖..."
+    if command -v apt >/dev/null 2>&1; then
+        apt update -qq && apt install -y curl >/dev/null 2>&1
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y curl >/dev/null 2>&1
+    elif command -v apk >/dev/null 2>&1; then
+        apk add curl >/dev/null 2>&1
+    else
+        err "未找到支持的包管理器 (apt/yum/apk)"
+        exit 1
+    fi
+
+    if command -v curl >/dev/null 2>&1; then
+        ok "curl 安装成功"
+    else
+        err "curl 安装失败"
+        exit 1
     fi
 }
 
-
-# Default port installation
+# ── Install helpers ────────────────────────────────────────
 install_default() {
     LISTEN_PORT="$DEFAULT_PORT"
-    log_step "使用默认端口: $LISTEN_PORT"
+    ok "使用默认端口: ${BOLD}$LISTEN_PORT${NC}"
     _do_install
 }
 
-# Custom port installation
 install_custom() {
+    echo
     while true; do
-        read -p "请输入监听端口 [1-65535]: " input_port
+        read -p "  ${CYAN}请输入监听端口${NC} [1-65535]: " input_port
         if [[ "$input_port" =~ ^[0-9]+$ ]] && (( input_port >= 1 && input_port <= 65535 )); then
             LISTEN_PORT="$input_port"
             break
-        else
-            log_error "端口号无效，请输入 1-65535 之间的数字。"
         fi
+        err "端口号无效，请输入 1-65535 之间的数字"
     done
     _do_install
 }
 
-# Internal install logic
 _do_install() {
+    echo
+    divider
+    echo
+
     if is_installed; then
-        log_info "wait-monitor 已安装。要升级，请使用升级选项。"
+        warn "wait-monitor 已安装，要升级请使用升级选项"
+        echo
         return
     fi
 
     install_dependencies
 
     local arch=$(detect_arch)
-    log_info "检测到架构: $arch"
+    ok "检测到架构: ${BOLD}$arch${NC}"
 
-    log_step "创建安装目录: $INSTALL_DIR"
-    mkdir -p "$INSTALL_DIR"
-
-    log_step "创建数据目录: $DATA_DIR"
-    mkdir -p "$DATA_DIR"
+    step "创建目录..."
+    mkdir -p "$INSTALL_DIR" "$DATA_DIR"
+    ok "$INSTALL_DIR"
 
     local file_name="wait-linux-${arch}"
     local download_url="${RELEASE_REPO_URL}/latest/download/${file_name}"
 
-    log_step "下载 wait-monitor 二进制文件..."
-    log_info "URL: $download_url"
-
-    if ! curl -fL -o "$BINARY_PATH" "$download_url"; then
-        log_error "下载失败，请确认 release 产物存在且当前安装脚本有权限访问该下载地址"
+    step "下载二进制文件..."
+    (curl -fL# -o "$BINARY_PATH" "$download_url") 2>&1 &
+    spinner $! "正在下载..."
+    if [ $? -ne 0 ]; then
+        echo
+        err "下载失败，请确认 release 产物存在且有权限访问"
         return 1
     fi
+    echo
+    ok "下载完成"
 
     chmod +x "$BINARY_PATH"
-    log_success "wait-monitor 二进制文件安装完成: $BINARY_PATH"
 
     if ! check_systemd; then
-        log_step "警告：未检测到 systemd，跳过服务创建。"
-        log_step "您可以从命令行手动运行 wait-monitor："
-        log_step "    $BINARY_PATH server -l 0.0.0.0:$LISTEN_PORT"
+        warn "未检测到 systemd，跳过服务创建"
         echo
-        log_success "安装完成！"
+        info "  手动运行: ${CYAN}$BINARY_PATH server -l 0.0.0.0:$LISTEN_PORT${NC}"
+        echo
+        ok "安装完成！"
         return
     fi
 
     create_systemd_service "$LISTEN_PORT"
 
+    step "注册 systemd 服务..."
     systemctl daemon-reload
     systemctl enable ${SERVICE_NAME}.service
     systemctl start ${SERVICE_NAME}.service
+    ok "服务已注册并启动"
 
     if systemctl is-active --quiet ${SERVICE_NAME}.service; then
-        log_success "wait-monitor 服务启动成功"
-
-        log_step "正在获取初始密码..."
+        ok "wait-monitor 运行中"
+        echo
+        step "获取初始密码..."
         sleep 5
         local password=$(journalctl -u ${SERVICE_NAME} --since "1 minute ago" | grep "admin account created." | tail -n 1 | sed -e 's/.*admin account created.//')
         if [ -z "$password" ]; then
-            log_error "未能获取初始密码，请检查日志"
+            warn "未能获取初始密码，请检查日志"
         fi
         show_access_info "$password" "$LISTEN_PORT"
     else
-        log_error "wait-monitor 服务启动失败"
-        log_info "查看日志: journalctl -u ${SERVICE_NAME} -f"
+        err "wait-monitor 服务启动失败"
+        info "  查看日志: ${CYAN}journalctl -u ${SERVICE_NAME} -f${NC}"
         return 1
     fi
 }
 
-# Binary installation (entry point)
+# ── Install entry ──────────────────────────────────────────
 install_binary() {
-    log_step "安装 wait-monitor"
     echo
-    echo "请选择安装方式："
-    echo "  1) 默认安装（端口: $DEFAULT_PORT）"
-    echo "  2) 自定义端口"
+    step "安装 wait-monitor"
     echo
-
-    read -p "输入选项 [1-2]: " choice
+    info "  ${BOLD}1)${NC}  默认安装  (端口 ${CYAN}$DEFAULT_PORT${NC})"
+    info "  ${BOLD}2)${NC}  自定义端口"
+    echo
+    read -p "  选择 [1-2]: " choice
+    echo
 
     case $choice in
         1) install_default ;;
         2) install_custom ;;
-        *) log_error "无效选项"; return 1 ;;
+        *) err "无效选项"; return 1 ;;
     esac
 }
 
-# Create systemd service file
+# ── systemd service ────────────────────────────────────────
 create_systemd_service() {
     local port="$1"
-    log_step "创建 systemd 服务..."
-
     local service_file="/etc/systemd/system/${SERVICE_NAME}.service"
     cat > "$service_file" << EOF
 [Unit]
@@ -242,191 +251,175 @@ User=root
 [Install]
 WantedBy=multi-user.target
 EOF
-
-    log_success "systemd 服务文件创建完成"
+    ok "systemd 服务文件已创建"
 }
 
-# Show access information
+# ── Access info ────────────────────────────────────────────
 show_access_info() {
     local password=$1
     local port=${2:-$DEFAULT_PORT}
+    local ip=$(hostname -I | awk '{print $1}')
+
     echo
-    log_success "安装完成！"
+    divider
     echo
-    log_info "访问信息："
-    log_info "  URL: http://$(hostname -I | awk '{print $1}'):${port}"
+    echo -e "  ${GREEN}${BOLD}🎉 安装完成！${NC}"
+    echo
+    divider
+    echo
+    info "  ${BOLD}访问地址${NC}"
+    info "    ${CYAN}http://${ip}:${port}${NC}"
     if [ -n "$password" ]; then
-        log_info "初始登录信息（仅显示一次）: $password"
+        echo
+        info "  ${BOLD}初始密码${NC}  (仅显示一次)"
+        info "    ${YELLOW}${BOLD}$password${NC}"
     fi
     echo
-    log_info "服务管理命令："
-    log_info "  状态:  systemctl status $SERVICE_NAME"
-    log_info "  启动:   systemctl start $SERVICE_NAME"
-    log_info "  停止:    systemctl stop $SERVICE_NAME"
-    log_info "  重启: systemctl restart $SERVICE_NAME"
-    log_info "  日志:    journalctl -u $SERVICE_NAME -f"
+    divider
+    echo
+    info "  ${BOLD}常用命令${NC}"
+    info "    状态: ${CYAN}systemctl status $SERVICE_NAME${NC}"
+    info "    日志: ${CYAN}journalctl -u $SERVICE_NAME -f${NC}"
+    info "    重启: ${CYAN}systemctl restart $SERVICE_NAME${NC}"
+    echo
 }
 
-# Upgrade function
+# ── Upgrade ────────────────────────────────────────────────
 upgrade_wait() {
-    log_step "升级 wait-monitor..."
+    echo
+    step "升级 wait-monitor"
+    echo
 
     if ! is_installed; then
-        log_error "wait-monitor 未安装。请先安装它。"
+        err "wait-monitor 未安装，请先安装"
         return 1
     fi
-
     if ! check_systemd; then
-        log_error "未检测到 systemd。无法管理服务。"
+        err "未检测到 systemd"
         return 1
     fi
 
-    log_step "停止 wait 服务..."
     systemctl stop ${SERVICE_NAME}.service
+    ok "服务已停止"
 
-    log_step "备份当前二进制文件..."
     local backup_path="${BINARY_PATH}.backup"
-    rm -f "$backup_path"
     cp "$BINARY_PATH" "$backup_path"
 
     local arch=$(detect_arch)
     local file_name="wait-linux-${arch}"
     local download_url="${RELEASE_REPO_URL}/latest/download/${file_name}"
 
-    log_step "下载最新版本..."
+    step "下载最新版本..."
     if ! curl -fL -o "$BINARY_PATH" "$download_url"; then
-        log_error "下载失败，正在从备份恢复"
+        err "下载失败，正在恢复"
         mv -f "$backup_path" "$BINARY_PATH"
         systemctl start ${SERVICE_NAME}.service
         return 1
     fi
-
+    ok "下载完成"
     rm -f "$backup_path"
-
     chmod +x "$BINARY_PATH"
 
-    log_step "重启 wait 服务..."
     systemctl start ${SERVICE_NAME}.service
-
     if systemctl is-active --quiet ${SERVICE_NAME}.service; then
-        log_success "wait-monitor 升级成功"
+        ok "wait-monitor 升级成功"
     else
-        log_error "服务在升级后未能启动"
+        err "服务升级后未能启动"
     fi
 }
 
-# Uninstall function
+# ── Uninstall ──────────────────────────────────────────────
 uninstall_wait() {
-    log_step "卸载 wait-monitor..."
+    echo
+    step "卸载 wait-monitor"
+    echo
 
     if ! is_installed; then
-        log_info "wait-monitor 未安装"
+        warn "wait-monitor 未安装"
+        echo
         return 0
     fi
 
-    read -p "这将删除 wait。您确定吗？(Y/n): " confirm
+    read -p "  ${RED}确认删除 wait-monitor？${NC} (Y/n): " confirm
     if [[ $confirm =~ ^[Nn]$ ]]; then
-        log_info "卸载已取消"
+        info "  已取消"
+        echo
         return 0
     fi
 
     if check_systemd; then
-        log_step "停止并禁用服务..."
         systemctl stop ${SERVICE_NAME}.service >/dev/null 2>&1
         systemctl disable ${SERVICE_NAME}.service >/dev/null 2>&1
         rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
         systemctl daemon-reload
-        log_success "systemd 服务已删除"
+        ok "systemd 服务已移除"
     fi
 
-    log_step "删除二进制文件..."
     rm -f "$BINARY_PATH"
-    # 尝试在目录为空时删除该目录
-    rmdir "$INSTALL_DIR" 2>/dev/null || log_info "数据目录 $INSTALL_DIR 不为空，未删除"
-    log_success "wait-monitor 二进制文件已删除"
+    ok "二进制文件已删除"
+    rmdir "$INSTALL_DIR" 2>/dev/null || warn "数据目录 $INSTALL_DIR 不为空，已保留"
 
-    log_success "wait-monitor 卸载完成"
-    log_info "数据文件保留在 $DATA_DIR"
+    echo
+    ok "wait-monitor 卸载完成"
+    info "  数据文件保留在 ${CYAN}$DATA_DIR${NC}"
+    echo
 }
 
-# Show service status
+# ── Status / Logs / Restart / Stop ─────────────────────────
 show_status() {
-    if ! is_installed; then
-        log_error "wait-monitor 未安装"
-        return
-    fi
-    if ! check_systemd; then
-        log_error "未检测到 systemd。无法获取服务状态。"
-        return
-    fi
-    log_step "wait 服务状态:"
+    if ! is_installed; then err "wait-monitor 未安装"; return; fi
+    if ! check_systemd; then err "未检测到 systemd"; return; fi
+    step "wait-monitor 服务状态:"
+    echo
     systemctl status ${SERVICE_NAME}.service --no-pager -l
 }
 
-# Show service logs
 show_logs() {
-    if ! is_installed; then
-        log_error "wait-monitor 未安装"
-        return
-    fi
-    if ! check_systemd; then
-        log_error "未检测到 systemd。无法获取服务日志。"
-        return
-    fi
-    log_step "查看 wait 服务日志..."
+    if ! is_installed; then err "wait-monitor 未安装"; return; fi
+    if ! check_systemd; then err "未检测到 systemd"; return; fi
+    step "查看 wait-monitor 服务日志:"
+    echo
     journalctl -u ${SERVICE_NAME} -f --no-pager
 }
 
-# Restart service
 restart_service() {
-    if ! is_installed; then
-        log_error "wait-monitor 未安装"
-        return
-    fi
-    if ! check_systemd; then
-        log_error "未检测到 systemd。无法重启服务。"
-        return
-    fi
-    log_step "重启 wait 服务..."
+    if ! is_installed; then err "wait-monitor 未安装"; return; fi
+    if ! check_systemd; then err "未检测到 systemd"; return; fi
+    step "重启 wait-monitor 服务..."
     systemctl restart ${SERVICE_NAME}.service
     if systemctl is-active --quiet ${SERVICE_NAME}.service; then
-        log_success "服务重启成功"
+        ok "服务已重启"
     else
-        log_error "服务重启失败"
+        err "重启失败"
     fi
 }
 
-# Stop service
 stop_service() {
-    if ! is_installed; then
-        log_error "wait-monitor 未安装"
-        return
-    fi
-    if ! check_systemd; then
-        log_error "未检测到 systemd。无法停止服务。"
-        return
-    fi
-    log_step "停止 wait 服务..."
+    if ! is_installed; then err "wait-monitor 未安装"; return; fi
+    if ! check_systemd; then err "未检测到 systemd"; return; fi
+    step "停止 wait-monitor 服务..."
     systemctl stop ${SERVICE_NAME}.service
-    log_success "服务已停止"
+    ok "服务已停止"
 }
 
-
-# Main menu
+# ── Main menu ──────────────────────────────────────────────
 main_menu() {
     show_banner
-    echo "请选择操作："
-    echo "  1) 安装 wait-monitor"
-    echo "  2) 升级 wait-monitor"
-    echo "  3) 卸载 wait-monitor"
-    echo "  4) 查看状态"
-    echo "  5) 查看日志"
-    echo "  6) 重启服务"
-    echo "  7) 停止服务"
-    echo "  8) 退出"
+    echo
+    info "  ${BOLD}1)${NC}  安装 wait-monitor"
+    info "  ${BOLD}2)${NC}  升级 wait-monitor"
+    info "  ${BOLD}3)${NC}  卸载 wait-monitor"
+    divider
+    info "  ${BOLD}4)${NC}  查看状态"
+    info "  ${BOLD}5)${NC}  查看日志"
+    info "  ${BOLD}6)${NC}  重启服务"
+    info "  ${BOLD}7)${NC}  停止服务"
+    divider
+    info "  ${BOLD}8)${NC}  退出"
     echo
 
-    read -p "输入选项 [1-8]: " choice
+    read -p "  选择 [1-8]: " choice
+    echo
 
     case $choice in
         1) install_binary ;;
@@ -437,10 +430,10 @@ main_menu() {
         6) restart_service ;;
         7) stop_service ;;
         8) exit 0 ;;
-        *) log_error "无效选项" ;;
+        *) err "无效选项" ;;
     esac
 }
 
-# Main execution
+# ── Entry ──────────────────────────────────────────────────
 check_root
 main_menu
