@@ -25,10 +25,10 @@ log_step() {
 
 
 # Global variables
-INSTALL_DIR="/opt/wait"
-DATA_DIR="/opt/wait"
-SERVICE_NAME="wait"
-BINARY_PATH="$INSTALL_DIR/wait"
+INSTALL_DIR="/opt/wait-monitor"
+DATA_DIR="/opt/wait-monitor"
+SERVICE_NAME="wait-monitor"
+BINARY_PATH="$INSTALL_DIR/wait-monitor"
 DEFAULT_PORT="25774"
 LISTEN_PORT=""
 REPO_OWNER="nimeng1222"
@@ -40,7 +40,7 @@ RELEASE_REPO_URL="${WAIT_MAIN_RELEASE_REPO_URL:-$DEFAULT_RELEASE_REPO_URL}"
 show_banner() {
     clear
     echo "=============================================================="
-    echo "            waiting System Installer"
+    echo "            Wait Monitor Installer"
     echo "       ${RELEASE_REPO_URL}"
     echo "=============================================================="
     echo
@@ -118,29 +118,33 @@ install_dependencies() {
 }
 
 
-# Binary installation
-install_binary() {
-    log_step "开始二进制安装..."
+# Default port installation
+install_default() {
+    LISTEN_PORT="$DEFAULT_PORT"
+    log_step "使用默认端口: $LISTEN_PORT"
+    _do_install
+}
 
-    if is_installed; then
-        log_info "wait 已安装。要升级，请使用升级选项。"
-        return
-    fi
-
-
-    # 监听端口输入，校验范围 1-65535
+# Custom port installation
+install_custom() {
     while true; do
-        read -p "请输入监听端口 [默认: $DEFAULT_PORT]: " input_port
-        if [[ -z "$input_port" ]]; then
-            LISTEN_PORT="$DEFAULT_PORT"
-            break
-        elif [[ "$input_port" =~ ^[0-9]+$ ]] && (( input_port >= 1 && input_port <= 65535 )); then
+        read -p "请输入监听端口 [1-65535]: " input_port
+        if [[ "$input_port" =~ ^[0-9]+$ ]] && (( input_port >= 1 && input_port <= 65535 )); then
             LISTEN_PORT="$input_port"
             break
         else
             log_error "端口号无效，请输入 1-65535 之间的数字。"
         fi
     done
+    _do_install
+}
+
+# Internal install logic
+_do_install() {
+    if is_installed; then
+        log_info "wait-monitor 已安装。要升级，请使用升级选项。"
+        return
+    fi
 
     install_dependencies
 
@@ -156,7 +160,7 @@ install_binary() {
     local file_name="wait-linux-${arch}"
     local download_url="${RELEASE_REPO_URL}/latest/download/${file_name}"
 
-    log_step "下载 wait 二进制文件..."
+    log_step "下载 wait-monitor 二进制文件..."
     log_info "URL: $download_url"
 
     if ! curl -fL -o "$BINARY_PATH" "$download_url"; then
@@ -165,11 +169,11 @@ install_binary() {
     fi
 
     chmod +x "$BINARY_PATH"
-    log_success "wait 二进制文件安装完成: $BINARY_PATH"
+    log_success "wait-monitor 二进制文件安装完成: $BINARY_PATH"
 
     if ! check_systemd; then
         log_step "警告：未检测到 systemd，跳过服务创建。"
-        log_step "您可以从命令行手动运行 wait："
+        log_step "您可以从命令行手动运行 wait-monitor："
         log_step "    $BINARY_PATH server -l 0.0.0.0:$LISTEN_PORT"
         echo
         log_success "安装完成！"
@@ -183,20 +187,38 @@ install_binary() {
     systemctl start ${SERVICE_NAME}.service
 
     if systemctl is-active --quiet ${SERVICE_NAME}.service; then
-        log_success "wait 服务启动成功"
-        
+        log_success "wait-monitor 服务启动成功"
+
         log_step "正在获取初始密码..."
-        sleep 5 
+        sleep 5
         local password=$(journalctl -u ${SERVICE_NAME} --since "1 minute ago" | grep "admin account created." | tail -n 1 | sed -e 's/.*admin account created.//')
         if [ -z "$password" ]; then
             log_error "未能获取初始密码，请检查日志"
         fi
         show_access_info "$password" "$LISTEN_PORT"
     else
-        log_error "wait 服务启动失败"
+        log_error "wait-monitor 服务启动失败"
         log_info "查看日志: journalctl -u ${SERVICE_NAME} -f"
         return 1
     fi
+}
+
+# Binary installation (entry point)
+install_binary() {
+    log_step "安装 wait-monitor"
+    echo
+    echo "请选择安装方式："
+    echo "  1) 默认安装（端口: $DEFAULT_PORT）"
+    echo "  2) 自定义端口"
+    echo
+
+    read -p "输入选项 [1-2]: " choice
+
+    case $choice in
+        1) install_default ;;
+        2) install_custom ;;
+        *) log_error "无效选项"; return 1 ;;
+    esac
 }
 
 # Create systemd service file
@@ -207,7 +229,7 @@ create_systemd_service() {
     local service_file="/etc/systemd/system/${SERVICE_NAME}.service"
     cat > "$service_file" << EOF
 [Unit]
-Description=wait Service
+Description=Wait Monitor Service
 After=network.target
 
 [Service]
@@ -247,10 +269,10 @@ show_access_info() {
 
 # Upgrade function
 upgrade_wait() {
-    log_step "升级 wait..."
+    log_step "升级 wait-monitor..."
 
     if ! is_installed; then
-        log_error "wait 未安装。请先安装它。"
+        log_error "wait-monitor 未安装。请先安装它。"
         return 1
     fi
 
@@ -287,7 +309,7 @@ upgrade_wait() {
     systemctl start ${SERVICE_NAME}.service
 
     if systemctl is-active --quiet ${SERVICE_NAME}.service; then
-        log_success "wait 升级成功"
+        log_success "wait-monitor 升级成功"
     else
         log_error "服务在升级后未能启动"
     fi
@@ -295,10 +317,10 @@ upgrade_wait() {
 
 # Uninstall function
 uninstall_wait() {
-    log_step "卸载 wait..."
+    log_step "卸载 wait-monitor..."
 
     if ! is_installed; then
-        log_info "wait 未安装"
+        log_info "wait-monitor 未安装"
         return 0
     fi
 
@@ -321,16 +343,16 @@ uninstall_wait() {
     rm -f "$BINARY_PATH"
     # 尝试在目录为空时删除该目录
     rmdir "$INSTALL_DIR" 2>/dev/null || log_info "数据目录 $INSTALL_DIR 不为空，未删除"
-    log_success "wait 二进制文件已删除"
+    log_success "wait-monitor 二进制文件已删除"
 
-    log_success "wait 卸载完成"
+    log_success "wait-monitor 卸载完成"
     log_info "数据文件保留在 $DATA_DIR"
 }
 
 # Show service status
 show_status() {
     if ! is_installed; then
-        log_error "wait 未安装"
+        log_error "wait-monitor 未安装"
         return
     fi
     if ! check_systemd; then
@@ -344,7 +366,7 @@ show_status() {
 # Show service logs
 show_logs() {
     if ! is_installed; then
-        log_error "wait 未安装"
+        log_error "wait-monitor 未安装"
         return
     fi
     if ! check_systemd; then
@@ -358,7 +380,7 @@ show_logs() {
 # Restart service
 restart_service() {
     if ! is_installed; then
-        log_error "wait 未安装"
+        log_error "wait-monitor 未安装"
         return
     fi
     if ! check_systemd; then
@@ -377,7 +399,7 @@ restart_service() {
 # Stop service
 stop_service() {
     if ! is_installed; then
-        log_error "wait 未安装"
+        log_error "wait-monitor 未安装"
         return
     fi
     if ! check_systemd; then
@@ -394,9 +416,9 @@ stop_service() {
 main_menu() {
     show_banner
     echo "请选择操作："
-    echo "  1) 安装 wait"
-    echo "  2) 升级 wait"
-    echo "  3) 卸载 wait"
+    echo "  1) 安装 wait-monitor"
+    echo "  2) 升级 wait-monitor"
+    echo "  3) 卸载 wait-monitor"
     echo "  4) 查看状态"
     echo "  5) 查看日志"
     echo "  6) 重启服务"
