@@ -402,6 +402,78 @@ stop_service() {
     ok "服务已停止"
 }
 
+# ── Uninstall agent ────────────────────────────────────────
+uninstall_agent() {
+    echo
+    step "卸载 wait-agent"
+    echo
+
+    # Detect if there are any known agent service names
+    local agent_services=("wait-agent" "wait_monitor_agent")
+
+    local found_any=false
+    if check_systemd; then
+        for svc in "${agent_services[@]}"; do
+            if systemctl list-unit-files 2>/dev/null | grep -q "${svc}.service"; then
+                found_any=true
+                step "停止并移除 systemd 服务: $svc"
+                systemctl stop "${svc}.service" 2>/dev/null
+                systemctl disable "${svc}.service" 2>/dev/null
+                rm -f "/etc/systemd/system/${svc}.service"
+                ok "服务已移除: $svc"
+            fi
+        done
+        systemctl daemon-reload
+    fi
+
+    # Check for OpenRC services
+    for svc in "${agent_services[@]}"; do
+        if [ -f "/etc/init.d/${svc}" ]; then
+            found_any=true
+            rc-service "${svc}" stop 2>/dev/null
+            rc-update del "${svc}" default 2>/dev/null
+            rm -f "/etc/init.d/${svc}"
+            ok "服务已移除: $svc (OpenRC)"
+        fi
+    done
+
+    # Remove common install directories
+    local agent_dirs=("/opt/wait" "/opt/wait-agent" "/usr/local/wait" "$HOME/.wait")
+    for dir in "${agent_dirs[@]}"; do
+        if [ -d "$dir" ] && [ -f "$dir/agent" ]; then
+            found_any=true
+            rm -rf "$dir"
+            ok "目录已删除: $dir"
+        fi
+    done
+
+    # macOS launchd
+    if [ "$(uname -s)" = "Darwin" ]; then
+        local plists=(
+            "/Library/LaunchDaemons/com.wait.wait-agent.plist"
+            "$HOME/Library/LaunchAgents/com.wait.wait-agent.plist"
+        )
+        for plist in "${plists[@]}"; do
+            if [ -f "$plist" ]; then
+                found_any=true
+                launchctl bootout system "$plist" 2>/dev/null || true
+                launchctl bootout gui/$(id -u) "$plist" 2>/dev/null || true
+                rm -f "$plist"
+                ok "launchd 服务已移除: $plist"
+            fi
+        done
+    fi
+
+    if [ "$found_any" = true ]; then
+        echo
+        ok "wait-agent 卸载完成"
+    else
+        echo
+        warn "未发现已安装的 agent 痕迹"
+    fi
+    echo
+}
+
 # ── Main menu ──────────────────────────────────────────────
 main_menu() {
     show_banner
@@ -414,11 +486,12 @@ main_menu() {
     info "  ${BOLD}5)${NC}  查看日志"
     info "  ${BOLD}6)${NC}  重启服务"
     info "  ${BOLD}7)${NC}  停止服务"
+    info "  ${BOLD}8)${NC}  卸载 agent"
     divider
-    info "  ${BOLD}8)${NC}  退出"
+    info "  ${BOLD}9)${NC}  退出"
     echo
 
-    read -p "  选择 [1-8]: " choice
+    read -p "  选择 [1-9]: " choice
     echo
 
     case $choice in
@@ -429,7 +502,8 @@ main_menu() {
         5) show_logs ;;
         6) restart_service ;;
         7) stop_service ;;
-        8) exit 0 ;;
+        8) uninstall_agent ;;
+        9) exit 0 ;;
         *) err "无效选项" ;;
     esac
 }
