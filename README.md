@@ -27,7 +27,7 @@
 | 💰 **订阅管理** | 续费提醒、过期预警、多币种成本统计，自动折算人民币 |
 | ⚙️ **管理面板** | 主题系统（明暗切换 + 自定义上传）、账户安全（2FA / OAuth SSO）、会话管理、操作日志 |
 | 🌐 **中英双语** | 内置中文 / English，运行时无缝切换 |
-| 🎨 **多平台支持** | Agent 支持 Windows、Linux、macOS、FreeBSD 全平台 |
+| 🎨 **多平台支持** | Agent 支持 Windows、Linux 全平台 |
 
 ## 🚀 快速开始
 
@@ -47,7 +47,7 @@ bash install-wait.sh
 | 组件 | 平台 |
 |------|------|
 | wait-monitor | linux/amd64, linux/arm64 |
-| wait-agent | Windows / Linux / macOS / FreeBSD |
+| wait-agent | Windows / Linux |
 
 ## 📦 发布版本
 
