@@ -23,7 +23,7 @@ REPO_OWNER="nimeng1222"
 REPO_NAME="wait-monitor"
 DEFAULT_RELEASE_REPO_URL="https://github.com/nimeng1222/wait-release/releases"
 RELEASE_REPO_URL="${WAIT_MAIN_RELEASE_REPO_URL:-$DEFAULT_RELEASE_REPO_URL}"
-VERSION="v0.1.15"
+VERSION="v0.1.19"
 
 # ── Logging helpers ────────────────────────────────────────
 info()    { echo -e "${NC}$1${NC}"; }
@@ -165,7 +165,7 @@ _do_install() {
     ok "$INSTALL_DIR"
 
     local file_name="wait-linux-${arch}"
-    local download_url="${RELEASE_REPO_URL}/latest/download/${file_name}"
+    local download_url="${RELEASE_REPO_URL}/download/${VERSION}/${file_name}"
 
     step "下载二进制文件..."
     (curl -fL# -o "$BINARY_PATH" "$download_url") 2>&1 &
@@ -179,6 +179,17 @@ _do_install() {
     ok "下载完成"
 
     chmod +x "$BINARY_PATH"
+
+    step "验证二进制兼容性..."
+    local verify_output=$("$BINARY_PATH" server -l 0.0.0.0:1 2>&1 | head -5 || true)
+    if echo "$verify_output" | grep -qi "CGO_ENABLED\|go-sqlite3\|requires cgo\|sqlite3.*cgo"; then
+        echo
+        err "二进制文件不兼容：检测到 CGO_ENABLED=0 构建，go-sqlite3 无法工作"
+        err "请重新下载最新 release：$RELEASE_REPO_URL/latest"
+        err "如问题持续，请到 GitHub 提 issue：https://github.com/nimeng1222/wait-monitor/issues"
+        return 1
+    fi
+    ok "二进制验证通过"
 
     if ! check_systemd; then
         warn "未检测到 systemd，跳过服务创建"
@@ -307,7 +318,7 @@ upgrade_wait() {
 
     local arch=$(detect_arch)
     local file_name="wait-linux-${arch}"
-    local download_url="${RELEASE_REPO_URL}/latest/download/${file_name}"
+    local download_url="${RELEASE_REPO_URL}/download/${VERSION}/${file_name}"
 
     step "下载最新版本..."
     if ! curl -fL -o "$BINARY_PATH" "$download_url"; then
@@ -319,6 +330,15 @@ upgrade_wait() {
     ok "下载完成"
     rm -f "$backup_path"
     chmod +x "$BINARY_PATH"
+
+    step "验证二进制兼容性..."
+    local verify_output=$("$BINARY_PATH" server -l 0.0.0.0:1 2>&1 | head -5 || true)
+    if echo "$verify_output" | grep -qi "CGO_ENABLED\|go-sqlite3\|requires cgo\|sqlite3.*cgo"; then
+        err "二进制文件不兼容，恢复备份并终止"
+        mv -f "$backup_path" "$BINARY_PATH"
+        return 1
+    fi
+    ok "二进制验证通过"
 
     systemctl start ${SERVICE_NAME}.service
     if systemctl is-active --quiet ${SERVICE_NAME}.service; then
