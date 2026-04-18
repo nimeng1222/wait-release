@@ -38,6 +38,15 @@ curl -fsSL https://raw.githubusercontent.com/nimeng1222/wait-release/main/instal
 bash install-wait.sh
 ```
 
+默认会安装或升级到最新 release。
+
+如果需要安装指定版本，可以这样执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nimeng1222/wait-release/main/install-wait.sh -o install-wait.sh
+WAIT_MAIN_RELEASE_VERSION=v0.1.25 bash install-wait.sh
+```
+
 安装完成后，访问 `http://<你的服务器IP>:25774` 进入管理面板。
 
 > 💡 Agent 安装更简单 —— 进入管理后台的 **节点管理**，点击对应节点的 **一键安装脚本** 即可完成部署。

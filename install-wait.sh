@@ -23,7 +23,13 @@ REPO_OWNER="nimeng1222"
 REPO_NAME="wait-monitor"
 DEFAULT_RELEASE_REPO_URL="https://github.com/nimeng1222/wait-release/releases"
 RELEASE_REPO_URL="${WAIT_MAIN_RELEASE_REPO_URL:-$DEFAULT_RELEASE_REPO_URL}"
-VERSION="v0.1.19"
+RELEASE_VERSION="${WAIT_MAIN_RELEASE_VERSION:-}"
+
+if [ -n "$RELEASE_VERSION" ]; then
+    RELEASE_LABEL="$RELEASE_VERSION"
+else
+    RELEASE_LABEL="latest"
+fi
 
 # ── Logging helpers ────────────────────────────────────────
 info()    { echo -e "${NC}$1${NC}"; }
@@ -62,10 +68,19 @@ show_banner() {
     echo "   ╚███╔███╔╝███████╗███████╗╚██████╔╝██║     ██████╔╝███████╗██║  ██║"
     echo "    ╚══╝╚══╝ ╚══════╝╚══════╝ ╚═════╝ ╚═╝     ╚═════╝ ╚══════╝╚═╝  ╚═╝"
     echo
-    echo -e "   ${GREEN}${BOLD}Infrastructure Monitor  •  ${VERSION}${NC}"
+    echo -e "   ${GREEN}${BOLD}Infrastructure Monitor  •  ${RELEASE_LABEL}${NC}"
     echo
     divider
     echo
+}
+
+build_download_url() {
+    local file_name="$1"
+    if [ -n "$RELEASE_VERSION" ]; then
+        echo "${RELEASE_REPO_URL}/download/${RELEASE_VERSION}/${file_name}"
+    else
+        echo "${RELEASE_REPO_URL}/latest/download/${file_name}"
+    fi
 }
 
 # ── Root & systemd checks ──────────────────────────────────
@@ -165,7 +180,8 @@ _do_install() {
     ok "$INSTALL_DIR"
 
     local file_name="wait-linux-${arch}"
-    local download_url="${RELEASE_REPO_URL}/download/${VERSION}/${file_name}"
+    local download_url
+    download_url="$(build_download_url "$file_name")"
 
     step "下载二进制文件..."
     (curl -fL# -o "$BINARY_PATH" "$download_url") 2>&1 &
@@ -318,7 +334,8 @@ upgrade_wait() {
 
     local arch=$(detect_arch)
     local file_name="wait-linux-${arch}"
-    local download_url="${RELEASE_REPO_URL}/download/${VERSION}/${file_name}"
+    local download_url
+    download_url="$(build_download_url "$file_name")"
 
     step "下载最新版本..."
     if ! curl -fL -o "$BINARY_PATH" "$download_url"; then
