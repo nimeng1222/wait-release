@@ -184,7 +184,7 @@ _do_install() {
     download_url="$(build_download_url "$file_name")"
 
     step "下载二进制文件..."
-    (curl -fL# -o "$BINARY_PATH" "$download_url") 2>&1 &
+    (curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fL# -o "$BINARY_PATH" "$download_url") 2>&1 &
     spinner $! "正在下载..."
     if [ $? -ne 0 ]; then
         echo
@@ -229,11 +229,13 @@ _do_install() {
         echo
         step "获取初始密码..."
         sleep 5
-        local password=$(journalctl -u ${SERVICE_NAME} --since "1 minute ago" | grep "admin account created." | tail -n 1 | sed -e 's/.*admin account created.//')
+        local credential_file="${DATA_DIR}/data/initial-admin-credentials.json"
+        local username=$(sed -n 's/.*"username":[[:space:]]*"\([^"]*\)".*/\1/p' "$credential_file" 2>/dev/null | head -n 1)
+        local password=$(sed -n 's/.*"password":[[:space:]]*"\([^"]*\)".*/\1/p' "$credential_file" 2>/dev/null | head -n 1)
         if [ -z "$password" ]; then
-            warn "未能获取初始密码，请检查日志"
+            warn "未能读取初始凭据文件，请检查 ${credential_file}"
         fi
-        show_access_info "$password" "$LISTEN_PORT"
+        show_access_info "$username" "$password" "$LISTEN_PORT" "$credential_file"
     else
         err "wait-monitor 服务启动失败"
         info "  查看日志: ${CYAN}journalctl -u ${SERVICE_NAME} -f${NC}"
@@ -283,8 +285,10 @@ EOF
 
 # ── Access info ────────────────────────────────────────────
 show_access_info() {
-    local password=$1
-    local port=${2:-$DEFAULT_PORT}
+    local username=$1
+    local password=$2
+    local port=${3:-$DEFAULT_PORT}
+    local credential_file=$4
     local ip=$(hostname -I | awk '{print $1}')
 
     echo
@@ -298,8 +302,12 @@ show_access_info() {
     info "    ${CYAN}http://${ip}:${port}${NC}"
     if [ -n "$password" ]; then
         echo
-        info "  ${BOLD}初始密码${NC}  (仅显示一次)"
-        info "    ${YELLOW}${BOLD}$password${NC}"
+        info "  ${BOLD}初始登录信息${NC}  (仅显示一次)"
+        info "    用户名: ${YELLOW}${BOLD}${username:-admin}${NC}"
+        info "    密码: ${YELLOW}${BOLD}$password${NC}"
+        if [ -n "$credential_file" ]; then
+            info "    凭据文件: ${CYAN}${credential_file}${NC}"
+        fi
     fi
     echo
     divider
@@ -338,7 +346,7 @@ upgrade_wait() {
     download_url="$(build_download_url "$file_name")"
 
     step "下载最新版本..."
-    if ! curl -fL -o "$BINARY_PATH" "$download_url"; then
+    if ! curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fL -o "$BINARY_PATH" "$download_url"; then
         err "下载失败，正在恢复"
         mv -f "$backup_path" "$BINARY_PATH"
         systemctl start ${SERVICE_NAME}.service
