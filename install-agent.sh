@@ -63,7 +63,7 @@ AGENT_PATH="$INSTALL_DIR/agent"
 log_step "下载 agent 二进制..."
 log_info "  URL: $DOWNLOAD_URL"
 
-if ! curl -fL -o "$AGENT_PATH" "$DOWNLOAD_URL"; then
+if ! curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fL -o "$AGENT_PATH" "$DOWNLOAD_URL"; then
     log_err "下载失败"
     exit 1
 fi
@@ -77,6 +77,14 @@ if ! command -v systemctl >/dev/null 2>&1; then
 fi
 
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+ENV_FILE="${INSTALL_DIR}/${SERVICE_NAME}.env"
+umask 077
+cat > "$ENV_FILE" << EOF
+WAIT_AGENT_ENDPOINT=${ENDPOINT}
+WAIT_AGENT_TOKEN=${TOKEN}
+EOF
+chmod 600 "$ENV_FILE"
+
 cat > "$SERVICE_FILE" << EOF
 [Unit]
 Description=Wait Agent Service
@@ -84,10 +92,22 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=${AGENT_PATH} --endpoint "${ENDPOINT}" --token "${TOKEN}"
+EnvironmentFile=-${ENV_FILE}
+ExecStart=${AGENT_PATH} --endpoint=\${WAIT_AGENT_ENDPOINT} --token=\${WAIT_AGENT_TOKEN}
 WorkingDirectory=${INSTALL_DIR}
 Restart=always
 User=root
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=${INSTALL_DIR}
 
 [Install]
 WantedBy=multi-user.target
