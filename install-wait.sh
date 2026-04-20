@@ -24,6 +24,11 @@ REPO_NAME="wait-monitor"
 DEFAULT_RELEASE_REPO_URL="https://github.com/nimeng1222/wait-release/releases"
 RELEASE_REPO_URL="${WAIT_MAIN_RELEASE_REPO_URL:-$DEFAULT_RELEASE_REPO_URL}"
 RELEASE_VERSION="${WAIT_MAIN_RELEASE_VERSION:-}"
+SERVICE_USER="wait-monitor"
+SERVICE_GROUP="wait-monitor"
+RUNTIME_USER="root"
+RUNTIME_GROUP="root"
+SERVICE_DATA_DIR="${INSTALL_DIR}/data"
 
 if [ -n "$RELEASE_VERSION" ]; then
     RELEASE_LABEL="$RELEASE_VERSION"
@@ -80,6 +85,152 @@ build_download_url() {
         echo "${RELEASE_REPO_URL}/download/${RELEASE_VERSION}/${file_name}"
     else
         echo "${RELEASE_REPO_URL}/latest/download/${file_name}"
+    fi
+}
+
+sha256_file() {
+    local file_path="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$file_path" | awk '{print $1}'
+        return
+    fi
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$file_path" | awk '{print $1}'
+        return
+    fi
+    if command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$file_path" | awk '{print $NF}'
+        return
+    fi
+    err "未找到 sha256 校验工具"
+    exit 1
+}
+
+copy_backup_verified() {
+    local source_path="$1"
+    local backup_path="$2"
+
+    rm -f "$backup_path"
+    cp "$source_path" "$backup_path"
+    if [ ! -s "$backup_path" ]; then
+        return 1
+    fi
+
+    local source_hash
+    local backup_hash
+    source_hash="$(sha256_file "$source_path")"
+    backup_hash="$(sha256_file "$backup_path")"
+    if [ "$source_hash" != "$backup_hash" ]; then
+        return 1
+    fi
+
+    chmod +x "$backup_path"
+    printf '%s\n' "$source_hash"
+}
+
+restore_backup_verified() {
+    local backup_path="$1"
+    local destination_path="$2"
+    local expected_hash="$3"
+
+    cp "$backup_path" "$destination_path"
+    chmod +x "$destination_path"
+    if [ -n "$expected_hash" ] && [ "$(sha256_file "$destination_path")" != "$expected_hash" ]; then
+        return 1
+    fi
+}
+
+verify_binary_compatible() {
+    local binary_path="$1"
+    local verify_output
+    verify_output=$("$binary_path" server -l 0.0.0.0:1 2>&1 | head -5 || true)
+    if echo "$verify_output" | grep -qi "CGO_ENABLED\|go-sqlite3\|requires cgo\|sqlite3.*cgo"; then
+        return 1
+    fi
+}
+
+ensure_service_account() {
+    if id -u "$SERVICE_USER" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if command -v useradd >/dev/null 2>&1; then
+        useradd --system --home-dir "$INSTALL_DIR" --shell /usr/sbin/nologin --user-group "$SERVICE_USER" 2>/dev/null \
+            || useradd --system --home "$INSTALL_DIR" --shell /bin/false "$SERVICE_USER" 2>/dev/null \
+            || true
+    elif command -v adduser >/dev/null 2>&1; then
+        adduser --system --home "$INSTALL_DIR" --shell /usr/sbin/nologin "$SERVICE_USER" 2>/dev/null \
+            || adduser -S -D -H -h "$INSTALL_DIR" "$SERVICE_USER" 2>/dev/null \
+            || true
+    fi
+
+    id -u "$SERVICE_USER" >/dev/null 2>&1
+}
+
+select_runtime_identity() {
+    local port="$1"
+    RUNTIME_USER="root"
+    RUNTIME_GROUP="root"
+
+    if ! ensure_service_account; then
+        warn "无法创建专用服务账号，将继续以 root 运行"
+        return
+    fi
+
+    if [ "$port" -lt 1024 ] && ! command -v setcap >/dev/null 2>&1; then
+        warn "监听端口低于 1024 且未检测到 setcap，将继续以 root 运行"
+        return
+    fi
+
+    RUNTIME_USER="$SERVICE_USER"
+    RUNTIME_GROUP="$SERVICE_GROUP"
+}
+
+prepare_runtime_paths() {
+    mkdir -p "$INSTALL_DIR" "$SERVICE_DATA_DIR"
+    chmod 755 "$INSTALL_DIR"
+    if [ "$RUNTIME_USER" != "root" ]; then
+        chown -R "$RUNTIME_USER:$RUNTIME_GROUP" "$SERVICE_DATA_DIR"
+        chmod 750 "$SERVICE_DATA_DIR"
+    fi
+}
+
+current_service_file() {
+    echo "/etc/systemd/system/${SERVICE_NAME}.service"
+}
+
+current_service_user() {
+    local service_file
+    service_file="$(current_service_file)"
+    if [ ! -f "$service_file" ]; then
+        echo "root"
+        return
+    fi
+    sed -n 's/^User=//p' "$service_file" | head -n 1
+}
+
+current_service_port() {
+    local service_file
+    service_file="$(current_service_file)"
+    if [ ! -f "$service_file" ]; then
+        echo "$DEFAULT_PORT"
+        return
+    fi
+    sed -n 's/^ExecStart=.*0\.0\.0\.0:\([0-9][0-9]*\).*$/\1/p' "$service_file" | head -n 1
+}
+
+configure_binary_runtime_privileges() {
+    local port="$1"
+    if command -v setcap >/dev/null 2>&1; then
+        setcap -r "$BINARY_PATH" 2>/dev/null || true
+    fi
+
+    if [ "$RUNTIME_USER" != "root" ] && [ "$port" -lt 1024 ]; then
+        if ! command -v setcap >/dev/null 2>&1; then
+            err "端口低于 1024 时需要 setcap 支持非 root 绑定"
+            return 1
+        fi
+        setcap cap_net_bind_service=+ep "$BINARY_PATH"
     fi
 }
 
@@ -176,7 +327,9 @@ _do_install() {
     ok "检测到架构: ${BOLD}$arch${NC}"
 
     step "创建目录..."
+    select_runtime_identity "$LISTEN_PORT"
     mkdir -p "$INSTALL_DIR" "$DATA_DIR"
+    prepare_runtime_paths
     ok "$INSTALL_DIR"
 
     local file_name="wait-linux-${arch}"
@@ -197,8 +350,7 @@ _do_install() {
     chmod +x "$BINARY_PATH"
 
     step "验证二进制兼容性..."
-    local verify_output=$("$BINARY_PATH" server -l 0.0.0.0:1 2>&1 | head -5 || true)
-    if echo "$verify_output" | grep -qi "CGO_ENABLED\|go-sqlite3\|requires cgo\|sqlite3.*cgo"; then
+    if ! verify_binary_compatible "$BINARY_PATH"; then
         echo
         err "二进制文件不兼容：检测到 CGO_ENABLED=0 构建，go-sqlite3 无法工作"
         err "请重新下载最新 release：$RELEASE_REPO_URL/latest"
@@ -206,6 +358,7 @@ _do_install() {
         return 1
     fi
     ok "二进制验证通过"
+    configure_binary_runtime_privileges "$LISTEN_PORT"
 
     if ! check_systemd; then
         warn "未检测到 systemd，跳过服务创建"
@@ -275,7 +428,19 @@ Type=simple
 ExecStart=${BINARY_PATH} server -l 0.0.0.0:${port}
 WorkingDirectory=${DATA_DIR}
 Restart=always
-User=root
+User=${RUNTIME_USER}
+Group=${RUNTIME_GROUP}
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=${SERVICE_DATA_DIR}
 
 [Install]
 WantedBy=multi-user.target
@@ -338,7 +503,28 @@ upgrade_wait() {
     ok "服务已停止"
 
     local backup_path="${BINARY_PATH}.backup"
-    cp "$BINARY_PATH" "$backup_path"
+    local backup_hash
+    backup_hash="$(copy_backup_verified "$BINARY_PATH" "$backup_path")" || {
+        err "备份当前二进制失败，已中止升级"
+        systemctl start ${SERVICE_NAME}.service
+        return 1
+    }
+    local current_port
+    local configured_user
+    current_port="$(current_service_port)"
+    configured_user="$(current_service_user)"
+    if [ -z "$current_port" ]; then
+        current_port="$DEFAULT_PORT"
+    fi
+    if [ -n "$configured_user" ] && [ "$configured_user" != "root" ]; then
+        ensure_service_account || warn "未能确认专用服务账号存在，将保留当前服务文件配置"
+        RUNTIME_USER="$configured_user"
+        RUNTIME_GROUP="$configured_user"
+    else
+        RUNTIME_USER="root"
+        RUNTIME_GROUP="root"
+    fi
+    prepare_runtime_paths
 
     local arch=$(detect_arch)
     local file_name="wait-linux-${arch}"
@@ -348,28 +534,42 @@ upgrade_wait() {
     step "下载最新版本..."
     if ! curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fL -o "$BINARY_PATH" "$download_url"; then
         err "下载失败，正在恢复"
-        mv -f "$backup_path" "$BINARY_PATH"
+        restore_backup_verified "$backup_path" "$BINARY_PATH" "$backup_hash" || err "恢复备份校验失败，请手动检查 ${backup_path}"
+        configure_binary_runtime_privileges "$current_port" || true
         systemctl start ${SERVICE_NAME}.service
         return 1
     fi
-    ok "下载完成"
-    rm -f "$backup_path"
     chmod +x "$BINARY_PATH"
+    ok "下载完成"
 
     step "验证二进制兼容性..."
-    local verify_output=$("$BINARY_PATH" server -l 0.0.0.0:1 2>&1 | head -5 || true)
-    if echo "$verify_output" | grep -qi "CGO_ENABLED\|go-sqlite3\|requires cgo\|sqlite3.*cgo"; then
+    if ! verify_binary_compatible "$BINARY_PATH"; then
         err "二进制文件不兼容，恢复备份并终止"
-        mv -f "$backup_path" "$BINARY_PATH"
+        restore_backup_verified "$backup_path" "$BINARY_PATH" "$backup_hash" || err "恢复备份校验失败，请手动检查 ${backup_path}"
+        configure_binary_runtime_privileges "$current_port" || true
+        systemctl start ${SERVICE_NAME}.service
         return 1
     fi
     ok "二进制验证通过"
+    if ! configure_binary_runtime_privileges "$current_port"; then
+        err "应用运行权限失败，恢复备份并终止"
+        restore_backup_verified "$backup_path" "$BINARY_PATH" "$backup_hash" || err "恢复备份校验失败，请手动检查 ${backup_path}"
+        configure_binary_runtime_privileges "$current_port" || true
+        systemctl start ${SERVICE_NAME}.service
+        return 1
+    fi
 
     systemctl start ${SERVICE_NAME}.service
     if systemctl is-active --quiet ${SERVICE_NAME}.service; then
         ok "wait-monitor 升级成功"
+        rm -f "$backup_path"
     else
         err "服务升级后未能启动"
+        warn "正在回滚到备份版本..."
+        restore_backup_verified "$backup_path" "$BINARY_PATH" "$backup_hash" || err "恢复备份校验失败，请手动检查 ${backup_path}"
+        configure_binary_runtime_privileges "$current_port" || true
+        systemctl start ${SERVICE_NAME}.service || true
+        return 1
     fi
 }
 
