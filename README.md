@@ -47,6 +47,14 @@ curl -fsSL https://raw.githubusercontent.com/nimeng1222/wait-release/main/instal
 WAIT_MAIN_RELEASE_VERSION=v0.1.25 bash install-wait.sh
 ```
 
+如果需要切换下载源，也可以覆盖默认的公开镜像地址：
+
+```bash
+WAIT_MAIN_RELEASE_REPO_URL="https://github.com/nimeng1222/wait-release/releases" \
+WAIT_MAIN_RELEASE_VERSION="v0.1.25" \
+bash install-wait.sh
+```
+
 安装完成后，访问 `http://<你的服务器IP>:25774` 进入管理面板。
 
 > 💡 Agent 安装更简单 —— 进入管理后台的 **节点管理**，点击对应节点的 **一键安装脚本** 即可完成部署。
@@ -61,6 +69,19 @@ WAIT_MAIN_RELEASE_VERSION=v0.1.25 bash install-wait.sh
 ## 📦 发布版本
 
 所有历史版本可在 [Releases](https://github.com/nimeng1222/wait-release/releases) 查看并下载。
+
+### Release Routing
+
+- `nimeng1222/wait-monitor`
+  - wait-monitor 的 canonical 源码仓库与正式 tag
+- `nimeng1222/wait-agent`
+  - wait-agent 的 canonical 源码仓库与正式 tag
+- `nimeng1222/wait-release`
+  - 面向安装脚本的公开镜像与聚合下载仓库
+  - 默认安装脚本从这里下载产物；如需切换，可使用：
+    - `WAIT_MAIN_RELEASE_REPO_URL`
+    - `WAIT_MAIN_RELEASE_VERSION`
+    - `WAIT_AGENT_RELEASE_REPO_URL`
 
 ## 📄 许可证
 
