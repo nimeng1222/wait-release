@@ -88,6 +88,12 @@ build_download_url() {
     fi
 }
 
+download_release_asset() {
+    local url="$1"
+    local output_path="$2"
+    curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fL -o "$output_path" "$url"
+}
+
 sha256_file() {
     local file_path="$1"
     if command -v sha256sum >/dev/null 2>&1; then
@@ -104,6 +110,53 @@ sha256_file() {
     fi
     err "未找到 sha256 校验工具"
     exit 1
+}
+
+download_release_checksums() {
+    local checksum_url
+    local checksums_path
+    checksum_url="$(build_download_url "SHA256SUMS.txt")"
+    checksums_path="$(mktemp)"
+    if ! download_release_asset "$checksum_url" "$checksums_path"; then
+        rm -f "$checksums_path"
+        return 1
+    fi
+    printf '%s\n' "$checksums_path"
+}
+
+expected_release_checksum() {
+    local checksums_path="$1"
+    local file_name="$2"
+    awk -v bare="$file_name" -v wait_main_path="wait-main/${file_name}" '$2 == bare || $2 == wait_main_path { print $1; exit }' "$checksums_path"
+}
+
+verify_downloaded_release_file() {
+    local file_path="$1"
+    local file_name="$2"
+    local checksums_path
+    local expected_hash
+    local actual_hash
+
+    if ! checksums_path="$(download_release_checksums)"; then
+        err "无法下载 SHA256SUMS.txt，拒绝安装未校验二进制"
+        return 1
+    fi
+
+    expected_hash="$(expected_release_checksum "$checksums_path" "$file_name")"
+    rm -f "$checksums_path"
+
+    if [ -z "$expected_hash" ]; then
+        err "SHA256SUMS.txt 中未找到 ${file_name} 的校验值"
+        return 1
+    fi
+
+    actual_hash="$(sha256_file "$file_path")"
+    if [ "$actual_hash" != "$expected_hash" ]; then
+        err "下载文件校验失败: expected ${expected_hash}, got ${actual_hash}"
+        return 1
+    fi
+
+    ok "下载文件 SHA256 校验通过"
 }
 
 copy_backup_verified() {
@@ -337,7 +390,7 @@ _do_install() {
     download_url="$(build_download_url "$file_name")"
 
     step "下载二进制文件..."
-    (curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fL# -o "$BINARY_PATH" "$download_url") 2>&1 &
+    (download_release_asset "$download_url" "$BINARY_PATH") 2>&1 &
     spinner $! "正在下载..."
     if [ $? -ne 0 ]; then
         echo
@@ -346,6 +399,11 @@ _do_install() {
     fi
     echo
     ok "下载完成"
+
+    if ! verify_downloaded_release_file "$BINARY_PATH" "$file_name"; then
+        rm -f "$BINARY_PATH"
+        return 1
+    fi
 
     chmod +x "$BINARY_PATH"
 
@@ -532,8 +590,15 @@ upgrade_wait() {
     download_url="$(build_download_url "$file_name")"
 
     step "下载最新版本..."
-    if ! curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fL -o "$BINARY_PATH" "$download_url"; then
+    if ! download_release_asset "$download_url" "$BINARY_PATH"; then
         err "下载失败，正在恢复"
+        restore_backup_verified "$backup_path" "$BINARY_PATH" "$backup_hash" || err "恢复备份校验失败，请手动检查 ${backup_path}"
+        configure_binary_runtime_privileges "$current_port" || true
+        systemctl start ${SERVICE_NAME}.service
+        return 1
+    fi
+    if ! verify_downloaded_release_file "$BINARY_PATH" "$file_name"; then
+        err "新二进制校验失败，恢复备份并终止"
         restore_backup_verified "$backup_path" "$BINARY_PATH" "$backup_hash" || err "恢复备份校验失败，请手动检查 ${backup_path}"
         configure_binary_runtime_privileges "$current_port" || true
         systemctl start ${SERVICE_NAME}.service
