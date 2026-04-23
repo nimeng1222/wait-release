@@ -1,100 +1,197 @@
-<h1 align="center">⚡ Wait Monitor</h1>
+# Wait Monitor Release
 
-<p align="center">
-  <a href="#english">English</a>
-</p>
+Wait Monitor 是一个轻量级自托管服务器监控系统。本仓库是公开分发仓库，提供安装脚本和聚合发布产物；主控服务与 Agent 的源码分别维护在独立仓库中。
 
-<p align="center">
-  轻量级服务器监控面板，实时监控你的基础设施
-</p>
+- 主控服务发布源：`nimeng1222/wait-monitor`
+- Agent 发布源：`nimeng1222/wait-agent`
+- 公开安装与镜像下载：`nimeng1222/wait-release`
 
-<p align="center">
-  <a href="#快速开始">快速开始</a> ·
-  <a href="#功能特性">功能特性</a> ·
-  <a href="#支持平台">支持平台</a> ·
-  <a href="https://github.com/nimeng1222/wait-release/releases">版本列表</a>
-</p>
+## 功能概览
 
----
+- 实时监控：节点在线状态、CPU、内存、磁盘、网络流量。
+- 节点探针：Agent 通过长连接上报状态，支持 Linux 和 Windows 产物。
+- Web 管理面板：主控二进制内嵌前端，部署后直接访问浏览器管理。
+- 远程终端：通过管理面板连接节点终端。
+- 告警通知：离线、负载等事件通知。
+- 账户安全：登录、会话、2FA、OAuth SSO、审计日志。
+- 安装安全：安装脚本下载二进制后执行 SHA-256 校验，校验失败会拒绝安装。
 
-## ✨ 功能特性
+## 快速安装主控
 
-| 模块 | 说明 |
-|------|------|
-| 🖥️ **实时监控** | 节点在线状态、CPU / 内存 / 磁盘 / 网络流量，Ping 延迟检测（ICMP / TCP / HTTP） |
-| 💻 **远程终端** | WebSocket 全功能终端，自动重连，支持快捷键和剪贴板收发 |
-| 🔔 **告警通知** | 离线 / 负载告警，支持 Telegram、Webhook、邮件等多种通道 |
-| 💰 **订阅管理** | 续费提醒、过期预警、多币种成本统计，自动折算人民币 |
-| ⚙️ **管理面板** | 主题系统（明暗切换 + 自定义上传）、账户安全（2FA / OAuth SSO）、会话管理、操作日志 |
-| 🌐 **中英双语** | 内置中文 / English，运行时无缝切换 |
-| 🎨 **多平台支持** | Agent 支持 Windows、Linux 全平台 |
-
-## 🚀 快速开始
-
-一行命令，即刻部署：
+支持系统：Linux `amd64` / `arm64`，推荐使用带 systemd 的发行版。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nimeng1222/wait-release/main/install-wait.sh -o install-wait.sh
-bash install-wait.sh
+sudo bash install-wait.sh
 ```
 
-默认会安装或升级到最新 release。
+脚本会打开交互菜单，可选择：
 
-如果需要安装指定版本，可以这样执行：
+- 安装 `wait-monitor`
+- 升级 `wait-monitor`
+- 卸载 `wait-monitor`
+- 查看状态、日志、重启或停止服务
+- 卸载 Agent
+
+默认安装信息：
+
+| 项目 | 默认值 |
+| --- | --- |
+| 访问端口 | `25774` |
+| 安装目录 | `/opt/wait-monitor` |
+| 数据目录 | `/opt/wait-monitor/data` |
+| 二进制路径 | `/opt/wait-monitor/wait-monitor` |
+| systemd 服务 | `wait-monitor.service` |
+| 运行用户 | 优先使用 `wait-monitor` 专用用户，必要时回退到 `root` |
+
+安装完成后访问：
+
+```text
+http://<server-ip>:25774
+```
+
+首次安装会在终端输出初始管理员账号密码。凭据文件位于：
+
+```text
+/opt/wait-monitor/data/initial-admin-credentials.json
+```
+
+首次成功登录后，服务端会自动删除该初始凭据文件。
+
+## 安装指定版本
+
+默认安装最新 release。如果需要固定版本：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nimeng1222/wait-release/main/install-wait.sh -o install-wait.sh
-WAIT_MAIN_RELEASE_VERSION=v0.1.25 bash install-wait.sh
+sudo WAIT_MAIN_RELEASE_VERSION=v0.1.33 bash install-wait.sh
 ```
 
-如果需要切换下载源，也可以覆盖默认的公开镜像地址：
+也可以切换下载源：
 
 ```bash
-WAIT_MAIN_RELEASE_REPO_URL="https://github.com/nimeng1222/wait-release/releases" \
-WAIT_MAIN_RELEASE_VERSION="v0.1.25" \
-bash install-wait.sh
+sudo WAIT_MAIN_RELEASE_REPO_URL="https://github.com/nimeng1222/wait-release/releases" \
+  WAIT_MAIN_RELEASE_VERSION="v0.1.33" \
+  bash install-wait.sh
 ```
 
-安装完成后，访问 `http://<你的服务器IP>:25774` 进入管理面板。
+## 安装 Agent
 
-> 💡 Agent 安装更简单 —— 进入管理后台的 **节点管理**，点击对应节点的 **一键安装脚本** 即可完成部署。
+Agent 通常不需要手动拼命令。推荐流程：
 
-## 🖧 支持平台
+1. 先安装并登录 Wait Monitor 主控。
+2. 在管理面板中创建或打开节点。
+3. 使用页面生成的一键安装命令安装 Agent。
 
-| 组件 | 平台 |
-|------|------|
-| wait-monitor | linux/amd64, linux/arm64 |
-| wait-agent | Windows / Linux |
+Agent 安装脚本需要主控地址和节点 token：
 
-## 📦 发布版本
+```bash
+curl -fsSL https://raw.githubusercontent.com/nimeng1222/wait-release/main/install-agent.sh -o install-agent.sh
+sudo bash install-agent.sh --endpoint "https://example.com" --token "YOUR_NODE_TOKEN"
+```
 
-所有历史版本可在 [Releases](https://github.com/nimeng1222/wait-release/releases) 查看并下载。
+Agent 默认信息：
 
-### Release Routing
+| 项目 | 默认值 |
+| --- | --- |
+| 安装目录 | `/opt/wait` |
+| 二进制路径 | `/opt/wait/agent` |
+| systemd 服务 | `wait-agent.service` |
+| 运行用户 | 优先使用 `wait-agent` 专用用户 |
 
-- `nimeng1222/wait-monitor`
-  - wait-monitor 的 canonical 源码仓库与正式 tag
-- `nimeng1222/wait-agent`
-  - wait-agent 的 canonical 源码仓库与正式 tag
-- `nimeng1222/wait-release`
-  - 面向安装脚本的公开镜像与聚合下载仓库
-  - 默认安装脚本从这里下载产物；如需切换，可使用：
-    - `WAIT_MAIN_RELEASE_REPO_URL`
-    - `WAIT_MAIN_RELEASE_VERSION`
-    - `WAIT_AGENT_RELEASE_REPO_URL`
+可选参数：
 
-## 📄 许可证
+```bash
+sudo bash install-agent.sh \
+  --endpoint "https://example.com" \
+  --token "YOUR_NODE_TOKEN" \
+  --install-dir "/opt/wait" \
+  --install-service-name "wait-agent"
+```
 
-[LICENSE](./LICENSE.wait-main)
+## 环境变量
 
----
+主控安装脚本：
+
+| 变量 | 说明 |
+| --- | --- |
+| `WAIT_MAIN_RELEASE_REPO_URL` | 主控二进制下载源，默认使用本仓库 release |
+| `WAIT_MAIN_RELEASE_VERSION` | 指定主控版本，例如 `v0.1.33`；为空时使用 latest |
+
+Agent 安装脚本：
+
+| 变量 | 说明 |
+| --- | --- |
+| `WAIT_AGENT_RELEASE_REPO_URL` | Agent 二进制下载源，默认使用本仓库 release |
+| `WAIT_AGENT_SKIP_CHECKSUM` | 设置为 `1` 会跳过 Agent 校验，不推荐，仅用于紧急排障 |
+
+## 常用运维命令
+
+主控服务：
+
+```bash
+sudo systemctl status wait-monitor
+sudo journalctl -u wait-monitor -f
+sudo systemctl restart wait-monitor
+sudo systemctl stop wait-monitor
+```
+
+Agent 服务：
+
+```bash
+sudo systemctl status wait-agent
+sudo journalctl -u wait-agent -f
+sudo systemctl restart wait-agent
+sudo systemctl stop wait-agent
+```
+
+重新打开主控安装管理菜单：
+
+```bash
+sudo bash install-wait.sh
+```
+
+## 发布产物
+
+本仓库 release 聚合提供以下类型产物：
+
+- `wait-linux-amd64`
+- `wait-linux-arm64`
+- `wait-agent-linux-amd64`
+- `wait-agent-linux-arm64`
+- `wait-agent-windows-amd64.exe`
+- `wait-agent-windows-arm64.exe`
+- `*.sha256`
+- `SHA256SUMS.txt`
+- `MANIFEST.txt`
+- `PROVENANCE.json`
+- `SBOM.*`
+- `LICENSE.*` / `NOTICE.*`
+
+安装脚本会优先下载校验文件并验证二进制完整性。主控安装脚本在校验通过后才会执行二进制兼容性检查。
+
+## 安全说明
+
+- 请优先使用 HTTPS 下载脚本和 release 资产。
+- 不建议跳过 SHA-256 校验。
+- 如需使用低于 `1024` 的端口，脚本会尝试使用 `setcap` 让非 root 服务绑定端口；如果系统不支持，可能回退为 root 运行。
+- 升级主控时脚本会先备份当前二进制；新版本下载、校验、兼容性检查或启动失败时会尝试回滚。
 
 ## English
 
-<a href="#english">↑ Back to top</a>
+Wait Monitor is a lightweight self-hosted server monitoring system. This repository is the public distribution repository for installers and release artifacts.
 
-<p>Wait Monitor is a lightweight server monitoring dashboard that provides real-time infrastructure tracking through a web-based admin panel.</p>
+Quick install:
 
-<p>Features include node status monitoring, remote terminal access, alert notifications, subscription billing management, multi-platform agent support, and built-in i18n (Chinese / English).</p>
+```bash
+curl -fsSL https://raw.githubusercontent.com/nimeng1222/wait-release/main/install-wait.sh -o install-wait.sh
+sudo bash install-wait.sh
+```
 
-<p>For more details, please refer to the Chinese section above or check the <a href="https://github.com/nimeng1222/wait-release/releases">Releases page</a>.</p>
+The server listens on port `25774` by default. After installation, open:
+
+```text
+http://<server-ip>:25774
+```
+
+The Agent should normally be installed from the admin panel, which generates the correct endpoint and token command for each node.
