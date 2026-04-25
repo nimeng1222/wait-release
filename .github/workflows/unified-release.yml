@@ -53,6 +53,7 @@ jobs:
     timeout-minutes: 45
 
     env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
       ROOT_DIR: ${{ github.workspace }}
       OUT_DIR: ${{ github.workspace }}/release-output
       WAIT_RELEASE_SIGNING_KEY: ${{ github.workspace }}/.wait-release-signing-key.pem
@@ -123,6 +124,9 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: "1.25.0"
+          cache-dependency-path: |
+            wait-main/go.sum
+            wait-agent-main/go.sum
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
