@@ -170,6 +170,52 @@ sudo bash install-wait.sh
 
 安装脚本会优先下载校验文件并验证二进制完整性。主控安装脚本在校验通过后才会执行二进制兼容性检查。
 
+## GitHub Actions 发版
+
+正式发版建议使用本仓库的 `Unified Release` workflow，不再从个人电脑直接执行发布。
+
+### 必要前置项
+
+1. 前端源码需要在 GitHub 仓库中可 checkout。默认 workflow 使用：
+
+   ```text
+   nimeng1222/wait-web-next
+   ```
+
+   如果前端仓库名称不同，手动触发 workflow 时修改 `web_repository` 输入。
+
+2. 在 `nimeng1222/wait-release` 仓库配置以下 Secrets：
+
+   | Secret | 说明 |
+   | --- | --- |
+   | `WAIT_RELEASE_SIGNING_KEY_PEM` | ECDSA release 签名私钥 PEM 内容，必须匹配安装脚本内置公钥 |
+   | `RELEASE_GITHUB_TOKEN` | 用于 checkout 源码仓库并创建三个 GitHub Release 的 token |
+
+   `RELEASE_GITHUB_TOKEN` 至少需要能读取 `wait-monitor`、`wait-agent`、前端仓库，并能对 `wait-monitor`、`wait-agent`、`wait-release` 创建 Release / 上传资产。Fine-grained PAT 推荐授予这些仓库的 `Contents: Read and write` 权限；classic PAT 可使用 `repo` scope。
+
+### 触发方式
+
+进入 GitHub：
+
+```text
+nimeng1222/wait-release -> Actions -> Unified Release -> Run workflow
+```
+
+常用输入：
+
+| 输入 | 默认值 | 说明 |
+| --- | --- | --- |
+| `main_ref` | `main` | 要发布的 `wait-monitor` ref |
+| `agent_ref` | `main` | 要发布的 `wait-agent` ref |
+| `web_repository` | `nimeng1222/wait-web-next` | 前端源码仓库 |
+| `web_ref` | `main` | 要嵌入的前端 ref |
+| `publish_releases` | `true` | 设为 `false` 时只 dry-run 构建并上传 `release-output` artifact |
+| `reuse_release_versions` | `false` | 默认自动 patch +1；设为 `true` 时复用当前版本 |
+| `allow_release_clobber` | `false` | 默认禁止覆盖已有 release 资产 |
+| `main_version` / `agent_version` | 空 | 显式指定版本时使用，例如 `v0.1.35` |
+
+workflow 会固定使用 Node 22、Go 1.25 和已验证签名的 Zig 0.14.1，构建完成后会验签 `SHA256SUMS.txt`、主控二进制和 agent 二进制，并把 `release-output` 作为短期 artifact 留档。
+
 ## 安全说明
 
 - 请优先使用 HTTPS 下载脚本和 release 资产。
