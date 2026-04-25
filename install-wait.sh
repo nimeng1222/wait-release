@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 # ============================================================
 #  Wait Monitor — Installer & Manager
@@ -19,16 +20,26 @@ SERVICE_NAME="wait-monitor"
 BINARY_PATH="$INSTALL_DIR/wait-monitor"
 DEFAULT_PORT="25774"
 LISTEN_PORT=""
-REPO_OWNER="nimeng1222"
-REPO_NAME="wait-monitor"
 DEFAULT_RELEASE_REPO_URL="https://github.com/nimeng1222/wait-release/releases"
 RELEASE_REPO_URL="${WAIT_MAIN_RELEASE_REPO_URL:-$DEFAULT_RELEASE_REPO_URL}"
 RELEASE_VERSION="${WAIT_MAIN_RELEASE_VERSION:-}"
+RELEASE_PUBKEY_PEM='-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEqwKHlqjanlDhWNH2OXQFWeSV+rLU
+BovnOCWSYJWlSh/4b+xwMKPAHqUMrfkRdEXrel7IH5pXhGQutdAfja+70Q==
+-----END PUBLIC KEY-----'
 SERVICE_USER="wait-monitor"
 SERVICE_GROUP="wait-monitor"
 RUNTIME_USER="root"
 RUNTIME_GROUP="root"
 SERVICE_DATA_DIR="${INSTALL_DIR}/data"
+TMP_DOWNLOAD_PATH=""
+
+cleanup() {
+    if [ -n "$TMP_DOWNLOAD_PATH" ] && [ -f "$TMP_DOWNLOAD_PATH" ]; then
+        rm -f "$TMP_DOWNLOAD_PATH"
+    fi
+}
+trap cleanup EXIT
 
 if [ -n "$RELEASE_VERSION" ]; then
     RELEASE_LABEL="$RELEASE_VERSION"
@@ -52,7 +63,7 @@ spinner() {
     local i=0
     while kill -0 "$pid" 2>/dev/null; do
         i=$(( (i+1) % 8 ))
-        printf "\r  ${CYAN}${spin:$i:1}${NC}  $msg"
+        printf '\r  %b%s%b  %s' "$CYAN" "${spin:$i:1}" "$NC" "$msg"
         sleep 0.1
     done
     wait "$pid"
@@ -124,6 +135,40 @@ download_release_checksums() {
     printf '%s\n' "$checksums_path"
 }
 
+download_release_signature_sidecar() {
+    local file_name="$1"
+    local signature_url
+    local signature_path
+    signature_url="$(build_download_url "${file_name}.sig")"
+    signature_path="$(mktemp)"
+    if ! download_release_asset "$signature_url" "$signature_path"; then
+        rm -f "$signature_path"
+        return 1
+    fi
+    printf '%s\n' "$signature_path"
+}
+
+verify_release_signature() {
+    local file_path="$1"
+    local file_name="$2"
+    local signature_path
+    local public_key_path
+
+    if ! signature_path="$(download_release_signature_sidecar "$file_name")"; then
+        err "无法下载 ${file_name}.sig，拒绝安装未签名二进制"
+        return 1
+    fi
+    public_key_path="$(mktemp)"
+    printf '%s\n' "$RELEASE_PUBKEY_PEM" > "$public_key_path"
+    if ! openssl dgst -sha256 -verify "$public_key_path" -signature "$signature_path" "$file_path" >/dev/null 2>&1; then
+        rm -f "$signature_path" "$public_key_path"
+        err "签名校验失败: ${file_name}"
+        return 1
+    fi
+    rm -f "$signature_path" "$public_key_path"
+    ok "ECDSA 签名校验通过"
+}
+
 expected_release_checksum() {
     local checksums_path="$1"
     local file_name="$2"
@@ -147,6 +192,10 @@ verify_downloaded_release_file() {
 
     if [ -z "$expected_hash" ]; then
         err "SHA256SUMS.txt 中未找到 ${file_name} 的校验值"
+        return 1
+    fi
+
+    if ! verify_release_signature "$file_path" "$file_name"; then
         return 1
     fi
 
@@ -241,7 +290,7 @@ select_runtime_identity() {
 
 prepare_runtime_paths() {
     mkdir -p "$INSTALL_DIR" "$SERVICE_DATA_DIR"
-    chmod 755 "$INSTALL_DIR"
+    chmod 700 "$INSTALL_DIR"
     if [ "$RUNTIME_USER" != "root" ]; then
         chown -R "$RUNTIME_USER:$RUNTIME_GROUP" "$SERVICE_DATA_DIR"
         chmod 750 "$SERVICE_DATA_DIR"
@@ -302,7 +351,8 @@ check_systemd() {
 
 # ── Architecture detection ─────────────────────────────────
 detect_arch() {
-    local arch=$(uname -m)
+    local arch
+    arch="$(uname -m)"
     case $arch in
         x86_64)  echo "amd64" ;;
         aarch64) echo "arm64" ;;
@@ -353,7 +403,7 @@ install_default() {
 install_custom() {
     echo
     while true; do
-        read -p "  ${CYAN}请输入监听端口${NC} [1-65535]: " input_port
+        read -r -p "  ${CYAN}请输入监听端口${NC} [1-65535]: " input_port
         if [[ "$input_port" =~ ^[0-9]+$ ]] && (( input_port >= 1 && input_port <= 65535 )); then
             LISTEN_PORT="$input_port"
             break
@@ -376,7 +426,8 @@ _do_install() {
 
     install_dependencies
 
-    local arch=$(detect_arch)
+    local arch
+    arch="$(detect_arch)"
     ok "检测到架构: ${BOLD}$arch${NC}"
 
     step "创建目录..."
@@ -390,25 +441,24 @@ _do_install() {
     download_url="$(build_download_url "$file_name")"
 
     step "下载二进制文件..."
-    (download_release_asset "$download_url" "$BINARY_PATH") 2>&1 &
-    spinner $! "正在下载..."
-    if [ $? -ne 0 ]; then
+    TMP_DOWNLOAD_PATH="$(mktemp "$INSTALL_DIR/wait.download.XXXXXX")"
+    (download_release_asset "$download_url" "$TMP_DOWNLOAD_PATH") 2>&1 &
+    local download_pid=$!
+    if ! spinner "$download_pid" "正在下载..."; then
         echo
         err "下载失败，请确认 release 产物存在且有权限访问"
         return 1
     fi
     echo
-    ok "下载完成"
 
-    if ! verify_downloaded_release_file "$BINARY_PATH" "$file_name"; then
-        rm -f "$BINARY_PATH"
+    if ! verify_downloaded_release_file "$TMP_DOWNLOAD_PATH" "$file_name"; then
         return 1
     fi
 
-    chmod +x "$BINARY_PATH"
+    chmod +x "$TMP_DOWNLOAD_PATH"
 
     step "验证二进制兼容性..."
-    if ! verify_binary_compatible "$BINARY_PATH"; then
+    if ! verify_binary_compatible "$TMP_DOWNLOAD_PATH"; then
         echo
         err "二进制文件不兼容：检测到 CGO_ENABLED=0 构建，go-sqlite3 无法工作"
         err "请重新下载最新 release：$RELEASE_REPO_URL/latest"
@@ -416,6 +466,11 @@ _do_install() {
         return 1
     fi
     ok "二进制验证通过"
+
+    install -m 755 "$TMP_DOWNLOAD_PATH" "$BINARY_PATH"
+    rm -f "$TMP_DOWNLOAD_PATH"
+    TMP_DOWNLOAD_PATH=""
+    ok "下载完成"
     configure_binary_runtime_privileges "$LISTEN_PORT"
 
     if ! check_systemd; then
@@ -441,8 +496,10 @@ _do_install() {
         step "获取初始密码..."
         sleep 5
         local credential_file="${DATA_DIR}/data/initial-admin-credentials.json"
-        local username=$(sed -n 's/.*"username":[[:space:]]*"\([^"]*\)".*/\1/p' "$credential_file" 2>/dev/null | head -n 1)
-        local password=$(sed -n 's/.*"password":[[:space:]]*"\([^"]*\)".*/\1/p' "$credential_file" 2>/dev/null | head -n 1)
+        local username
+        local password
+        username=$(sed -n 's/.*"username":[[:space:]]*"\([^"]*\)".*/\1/p' "$credential_file" 2>/dev/null | head -n 1)
+        password=$(sed -n 's/.*"password":[[:space:]]*"\([^"]*\)".*/\1/p' "$credential_file" 2>/dev/null | head -n 1)
         if [ -z "$password" ]; then
             warn "未能读取初始凭据文件，请检查 ${credential_file}"
         fi
@@ -462,7 +519,7 @@ install_binary() {
     info "  ${BOLD}1)${NC}  默认安装  (端口 ${CYAN}$DEFAULT_PORT${NC})"
     info "  ${BOLD}2)${NC}  自定义端口"
     echo
-    read -p "  选择 [1-2]: " choice
+    read -r -p "  选择 [1-2]: " choice
     echo
 
     case $choice in
@@ -512,7 +569,8 @@ show_access_info() {
     local password=$2
     local port=${3:-$DEFAULT_PORT}
     local credential_file=$4
-    local ip=$(hostname -I | awk '{print $1}')
+    local ip
+    ip=$(hostname -I | awk '{print $1}')
 
     echo
     divider
@@ -584,31 +642,33 @@ upgrade_wait() {
     fi
     prepare_runtime_paths
 
-    local arch=$(detect_arch)
+    local arch
+    arch="$(detect_arch)"
     local file_name="wait-linux-${arch}"
     local download_url
     download_url="$(build_download_url "$file_name")"
 
     step "下载最新版本..."
-    if ! download_release_asset "$download_url" "$BINARY_PATH"; then
+    TMP_DOWNLOAD_PATH="$(mktemp "$INSTALL_DIR/wait.download.XXXXXX")"
+    if ! download_release_asset "$download_url" "$TMP_DOWNLOAD_PATH"; then
         err "下载失败，正在恢复"
         restore_backup_verified "$backup_path" "$BINARY_PATH" "$backup_hash" || err "恢复备份校验失败，请手动检查 ${backup_path}"
         configure_binary_runtime_privileges "$current_port" || true
         systemctl start ${SERVICE_NAME}.service
         return 1
     fi
-    if ! verify_downloaded_release_file "$BINARY_PATH" "$file_name"; then
+    if ! verify_downloaded_release_file "$TMP_DOWNLOAD_PATH" "$file_name"; then
         err "新二进制校验失败，恢复备份并终止"
         restore_backup_verified "$backup_path" "$BINARY_PATH" "$backup_hash" || err "恢复备份校验失败，请手动检查 ${backup_path}"
         configure_binary_runtime_privileges "$current_port" || true
         systemctl start ${SERVICE_NAME}.service
         return 1
     fi
-    chmod +x "$BINARY_PATH"
+    chmod +x "$TMP_DOWNLOAD_PATH"
     ok "下载完成"
 
     step "验证二进制兼容性..."
-    if ! verify_binary_compatible "$BINARY_PATH"; then
+    if ! verify_binary_compatible "$TMP_DOWNLOAD_PATH"; then
         err "二进制文件不兼容，恢复备份并终止"
         restore_backup_verified "$backup_path" "$BINARY_PATH" "$backup_hash" || err "恢复备份校验失败，请手动检查 ${backup_path}"
         configure_binary_runtime_privileges "$current_port" || true
@@ -616,6 +676,9 @@ upgrade_wait() {
         return 1
     fi
     ok "二进制验证通过"
+    install -m 755 "$TMP_DOWNLOAD_PATH" "$BINARY_PATH"
+    rm -f "$TMP_DOWNLOAD_PATH"
+    TMP_DOWNLOAD_PATH=""
     if ! configure_binary_runtime_privileges "$current_port"; then
         err "应用运行权限失败，恢复备份并终止"
         restore_backup_verified "$backup_path" "$BINARY_PATH" "$backup_hash" || err "恢复备份校验失败，请手动检查 ${backup_path}"
@@ -650,7 +713,7 @@ uninstall_wait() {
         return 0
     fi
 
-    read -p "  ${RED}确认删除 wait-monitor？${NC} (Y/n): " confirm
+    read -r -p "  ${RED}确认删除 wait-monitor？${NC} (Y/n): " confirm
     if [[ $confirm =~ ^[Nn]$ ]]; then
         info "  已取消"
         echo
@@ -767,7 +830,7 @@ uninstall_agent() {
             if [ -f "$plist" ]; then
                 found_any=true
                 launchctl bootout system "$plist" 2>/dev/null || true
-                launchctl bootout gui/$(id -u) "$plist" 2>/dev/null || true
+                launchctl bootout "gui/$(id -u)" "$plist" 2>/dev/null || true
                 rm -f "$plist"
                 ok "launchd 服务已移除: $plist"
             fi
@@ -801,7 +864,7 @@ main_menu() {
     info "  ${BOLD}9)${NC}  退出"
     echo
 
-    read -p "  选择 [1-9]: " choice
+    read -r -p "  选择 [1-9]: " choice
     echo
 
     case $choice in

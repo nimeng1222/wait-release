@@ -1,21 +1,32 @@
 #!/bin/bash
+set -euo pipefail
 
 # Wait Agent Installer — used by admin panel's one-click install
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
-WHITE='\033[1;37m'
 NC='\033[0m'
 
 RELEASE_REPO_URL="${WAIT_AGENT_RELEASE_REPO_URL:-https://github.com/nimeng1222/wait-release/releases}"
 SKIP_CHECKSUM_VERIFY="${WAIT_AGENT_SKIP_CHECKSUM:-0}"
+RELEASE_PUBKEY_PEM='-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEqwKHlqjanlDhWNH2OXQFWeSV+rLU
+BovnOCWSYJWlSh/4b+xwMKPAHqUMrfkRdEXrel7IH5pXhGQutdAfja+70Q==
+-----END PUBLIC KEY-----'
 
 log_info()  { echo -e "${NC}$1"; }
 log_ok()    { echo -e "${GREEN}  ✓  $1${NC}"; }
 log_err()   { echo -e "${RED}  ✗  $1${NC}"; }
 log_step()  { echo -e "${CYAN}▸  ${NC}$1"; }
+
+TMP_DOWNLOAD_PATH=""
+cleanup() {
+    if [ -n "$TMP_DOWNLOAD_PATH" ] && [ -f "$TMP_DOWNLOAD_PATH" ]; then
+        rm -f "$TMP_DOWNLOAD_PATH"
+    fi
+}
+trap cleanup EXIT
 
 ensure_agent_account() {
     if id -u "$AGENT_USER" >/dev/null 2>&1; then
@@ -88,6 +99,40 @@ download_release_checksum_sidecar() {
     printf '%s\n' "$checksum_path"
 }
 
+download_release_signature_sidecar() {
+    local binary_name="$1"
+    local signature_url
+    local signature_path
+    signature_url="$(build_release_asset_url "${binary_name}.sig")"
+    signature_path="$(mktemp)"
+    if ! download_release_asset "$signature_url" "$signature_path"; then
+        rm -f "$signature_path"
+        return 1
+    fi
+    printf '%s\n' "$signature_path"
+}
+
+verify_release_signature() {
+    local file_path="$1"
+    local file_name="$2"
+    local signature_path
+    local public_key_path
+
+    if ! signature_path="$(download_release_signature_sidecar "$file_name")"; then
+        log_err "无法下载 ${file_name}.sig，拒绝安装未签名二进制"
+        return 1
+    fi
+    public_key_path="$(mktemp)"
+    printf '%s\n' "$RELEASE_PUBKEY_PEM" > "$public_key_path"
+    if ! openssl dgst -sha256 -verify "$public_key_path" -signature "$signature_path" "$file_path" >/dev/null 2>&1; then
+        rm -f "$signature_path" "$public_key_path"
+        log_err "签名校验失败：${file_name}"
+        return 1
+    fi
+    rm -f "$signature_path" "$public_key_path"
+    log_ok "ECDSA 签名校验通过"
+}
+
 extract_expected_checksum() {
     local checksum_path="$1"
     awk 'NF >= 1 {print $1; exit}' "$checksum_path"
@@ -115,6 +160,10 @@ verify_downloaded_release_file() {
 
     if [ -z "$expected_hash" ]; then
         log_err "${file_name}.sha256 内容无效"
+        return 1
+    fi
+
+    if ! verify_release_signature "$file_path" "$file_name"; then
         return 1
     fi
 
@@ -172,6 +221,7 @@ BINARY_NAME="wait-agent-${os_name}-${arch}"
 DOWNLOAD_URL="${RELEASE_REPO_URL}/latest/download/${BINARY_NAME}"
 
 mkdir -p "$INSTALL_DIR"
+chmod 700 "$INSTALL_DIR"
 AGENT_PATH="$INSTALL_DIR/agent"
 
 select_runtime_identity
@@ -179,15 +229,18 @@ select_runtime_identity
 log_step "下载 agent 二进制..."
 log_info "  URL: $DOWNLOAD_URL"
 
-if ! curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fL -o "$AGENT_PATH" "$DOWNLOAD_URL"; then
+TMP_DOWNLOAD_PATH="$(mktemp "$INSTALL_DIR/agent.download.XXXXXX")"
+if ! download_release_asset "$DOWNLOAD_URL" "$TMP_DOWNLOAD_PATH"; then
     log_err "下载失败"
     exit 1
 fi
-if ! verify_downloaded_release_file "$AGENT_PATH" "$BINARY_NAME"; then
-    rm -f "$AGENT_PATH"
+if ! verify_downloaded_release_file "$TMP_DOWNLOAD_PATH" "$BINARY_NAME"; then
     exit 1
 fi
-chmod +x "$AGENT_PATH"
+chmod +x "$TMP_DOWNLOAD_PATH"
+install -m 755 "$TMP_DOWNLOAD_PATH" "$AGENT_PATH"
+rm -f "$TMP_DOWNLOAD_PATH"
+TMP_DOWNLOAD_PATH=""
 if [ "$RUNTIME_USER" != "root" ]; then
     chown -R "$RUNTIME_USER:$RUNTIME_GROUP" "$INSTALL_DIR"
 fi
