@@ -55,7 +55,7 @@ jobs:
     env:
       ROOT_DIR: ${{ github.workspace }}
       OUT_DIR: ${{ github.workspace }}/release-output
-      WAIT_RELEASE_SIGNING_KEY: ${{ runner.temp }}/wait-release-signing-key.pem
+      WAIT_RELEASE_SIGNING_KEY: ${{ github.workspace }}/.wait-release-signing-key.pem
       GH_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
       PUBLISH_RELEASES: ${{ inputs.publish_releases && '1' || '0' }}
       REUSE_RELEASE_VERSIONS: ${{ inputs.reuse_release_versions && '1' || '0' }}
