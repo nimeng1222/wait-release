@@ -543,6 +543,7 @@ Type=simple
 ExecStart=${BINARY_PATH} server -l 0.0.0.0:${port}
 WorkingDirectory=${DATA_DIR}
 Restart=always
+TimeoutStopSec=15s
 User=${RUNTIME_USER}
 Group=${RUNTIME_GROUP}
 UMask=0077
@@ -600,6 +601,44 @@ show_access_info() {
     echo
 }
 
+stop_service_quickly() {
+    local service_unit="${SERVICE_NAME}.service"
+    local timeout_seconds="${WAIT_SERVICE_STOP_TIMEOUT:-15}"
+
+    if ! systemctl is-active --quiet "$service_unit"; then
+        ok "服务未运行"
+        return 0
+    fi
+
+    step "停止 wait-monitor 服务..."
+    systemctl stop --no-block "$service_unit" >/dev/null 2>&1 || true
+
+    local i
+    for ((i = 0; i < timeout_seconds; i++)); do
+        if ! systemctl is-active --quiet "$service_unit"; then
+            systemctl reset-failed "$service_unit" >/dev/null 2>&1 || true
+            ok "服务已停止"
+            return 0
+        fi
+        sleep 1
+    done
+
+    warn "服务停止超过 ${timeout_seconds}s，强制结束旧进程..."
+    systemctl kill -s SIGKILL "$service_unit" >/dev/null 2>&1 || true
+
+    for ((i = 0; i < 5; i++)); do
+        if ! systemctl is-active --quiet "$service_unit"; then
+            systemctl reset-failed "$service_unit" >/dev/null 2>&1 || true
+            ok "服务已强制停止"
+            return 0
+        fi
+        sleep 1
+    done
+
+    err "服务未能停止，请手动检查: systemctl status ${service_unit}"
+    return 1
+}
+
 # ── Upgrade ────────────────────────────────────────────────
 upgrade_wait() {
     echo
@@ -615,8 +654,9 @@ upgrade_wait() {
         return 1
     fi
 
-    systemctl stop ${SERVICE_NAME}.service
-    ok "服务已停止"
+    if ! stop_service_quickly; then
+        return 1
+    fi
 
     local backup_path="${BINARY_PATH}.backup"
     local backup_hash
