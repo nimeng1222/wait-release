@@ -245,8 +245,20 @@ restore_backup_verified() {
 verify_binary_compatible() {
     local binary_path="$1"
     local verify_output
-    verify_output=$("$binary_path" server -l 0.0.0.0:1 2>&1 | head -5 || true)
+    local verify_status=0
+    local verify_dir
+    verify_dir="$(mktemp -d "${INSTALL_DIR}/wait.verify.XXXXXX" 2>/dev/null || mktemp -d)"
+    if command -v timeout >/dev/null 2>&1; then
+        verify_output="$(cd "$verify_dir" && WAIT_DB_FILE="${verify_dir}/wait.db" timeout 8s "$binary_path" server -l 127.0.0.1:0 2>&1)" || verify_status=$?
+    else
+        verify_output="$(cd "$verify_dir" && WAIT_DB_FILE="${verify_dir}/wait.db" "$binary_path" server -l 127.0.0.1:0 2>&1 & pid=$!; sleep 8; kill "$pid" >/dev/null 2>&1 || true; wait "$pid" 2>/dev/null || true)"
+        verify_status=124
+    fi
+    rm -rf "$verify_dir"
     if echo "$verify_output" | grep -qi "CGO_ENABLED\|go-sqlite3\|requires cgo\|sqlite3.*cgo"; then
+        return 1
+    fi
+    if [ "$verify_status" -ne 0 ] && [ "$verify_status" -ne 124 ]; then
         return 1
     fi
 }
