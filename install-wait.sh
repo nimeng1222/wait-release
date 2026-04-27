@@ -543,7 +543,7 @@ Type=simple
 ExecStart=${BINARY_PATH} server -l 0.0.0.0:${port}
 WorkingDirectory=${DATA_DIR}
 Restart=always
-TimeoutStopSec=15s
+TimeoutStopSec=10s
 User=${RUNTIME_USER}
 Group=${RUNTIME_GROUP}
 UMask=0077
@@ -603,7 +603,7 @@ show_access_info() {
 
 stop_service_quickly() {
     local service_unit="${SERVICE_NAME}.service"
-    local timeout_seconds="${WAIT_SERVICE_STOP_TIMEOUT:-15}"
+    local timeout_seconds="${WAIT_SERVICE_STOP_TIMEOUT:-10}"
 
     if ! systemctl is-active --quiet "$service_unit"; then
         ok "服务未运行"
