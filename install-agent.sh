@@ -20,6 +20,14 @@ log_ok()    { echo -e "${GREEN}  ✓  $1${NC}"; }
 log_err()   { echo -e "${RED}  ✗  $1${NC}"; }
 log_step()  { echo -e "${CYAN}▸  ${NC}$1"; }
 
+usage() {
+    cat << EOF
+用法:
+  $0 --endpoint <URL> --token <TOKEN> [--install-dir <DIR>] [--install-service-name <NAME>]
+  $0 --uninstall [--install-dir <DIR>] [--install-service-name <NAME>]
+EOF
+}
+
 TMP_DOWNLOAD_PATH=""
 cleanup() {
     if [ -n "$TMP_DOWNLOAD_PATH" ] && [ -f "$TMP_DOWNLOAD_PATH" ]; then
@@ -176,6 +184,32 @@ verify_downloaded_release_file() {
     log_ok "SHA-256 校验通过"
 }
 
+uninstall_agent() {
+    AGENT_PATH="$INSTALL_DIR/agent"
+    SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+    ENV_FILE="${INSTALL_DIR}/${SERVICE_NAME}.env"
+
+    log_step "卸载 wait agent..."
+
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl list-unit-files "${SERVICE_NAME}.service" >/dev/null 2>&1 || [ -f "$SERVICE_FILE" ]; then
+            systemctl stop "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
+            systemctl disable "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
+        fi
+    fi
+
+    rm -f "$SERVICE_FILE"
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl reset-failed "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
+    fi
+
+    rm -f "$AGENT_PATH" "$ENV_FILE"
+    rmdir "$INSTALL_DIR" >/dev/null 2>&1 || true
+
+    log_ok "卸载完成"
+}
+
 # Parse arguments
 ENDPOINT=""
 TOKEN=""
@@ -184,9 +218,12 @@ SERVICE_NAME="wait-agent"
 AGENT_USER="wait-agent"
 RUNTIME_USER="root"
 RUNTIME_GROUP="root"
+UNINSTALL=0
 
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --uninstall) UNINSTALL=1; shift ;;
+        --help|-h) usage; exit 0 ;;
         --endpoint) ENDPOINT="$2"; shift 2 ;;
         --token)    TOKEN="$2";    shift 2 ;;
         --install-dir)           INSTALL_DIR="$2";     shift 2 ;;
@@ -195,8 +232,13 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [ "$UNINSTALL" = "1" ]; then
+    uninstall_agent
+    exit 0
+fi
+
 if [ -z "$ENDPOINT" ] || [ -z "$TOKEN" ]; then
-    log_err "用法: $0 --endpoint <URL> --token <TOKEN>"
+    usage
     exit 1
 fi
 
