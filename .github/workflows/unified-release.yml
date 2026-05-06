@@ -138,13 +138,41 @@ jobs:
       - name: Install Zig toolchain
         run: |
           set -euo pipefail
+          ZIG_VERSION="0.14.1"
+          ZIG_TARBALL="zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          ZIG_MINISIG="${ZIG_TARBALL}.minisig"
+          ZIG_DIR="/usr/local/zig-x86_64-linux-${ZIG_VERSION}"
+
           sudo apt-get update
           sudo apt-get install -y build-essential curl minisign xz-utils
-          curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSLO https://ziglang.org/download/0.14.1/zig-x86_64-linux-0.14.1.tar.xz
-          curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSLO https://ziglang.org/download/0.14.1/zig-x86_64-linux-0.14.1.tar.xz.minisig
-          minisign -Vm zig-x86_64-linux-0.14.1.tar.xz -P "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U"
-          sudo tar -C /usr/local -Jxf zig-x86_64-linux-0.14.1.tar.xz
-          printf '/usr/local/zig-x86_64-linux-0.14.1\n' >> "${GITHUB_PATH}"
+
+          if [ ! -x "${ZIG_DIR}/zig" ]; then
+            rm -f "${ZIG_TARBALL}" "${ZIG_MINISIG}"
+
+            download_from() {
+              local base_url="$1"
+              echo "Trying Zig download source: ${base_url}"
+              curl --proto '=https' --proto-redir '=https' --tlsv1.2 \
+                --retry 5 --retry-delay 3 --retry-all-errors \
+                --connect-timeout 20 --max-time 900 \
+                -fSL --continue-at - -o "${ZIG_TARBALL}" "${base_url}/${ZIG_TARBALL}"
+              curl --proto '=https' --proto-redir '=https' --tlsv1.2 \
+                --retry 5 --retry-delay 3 --retry-all-errors \
+                --connect-timeout 20 --max-time 120 \
+                -fSL -o "${ZIG_MINISIG}" "${base_url}/${ZIG_MINISIG}"
+            }
+
+            if ! download_from "https://ziglang.org/download/${ZIG_VERSION}"; then
+              echo "Primary Zig source failed, trying GitHub releases mirror..."
+              download_from "https://github.com/ziglang/zig/releases/download/${ZIG_VERSION}"
+            fi
+
+            minisign -Vm "${ZIG_TARBALL}" -P "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U"
+            sudo rm -rf "${ZIG_DIR}"
+            sudo tar -C /usr/local -Jxf "${ZIG_TARBALL}"
+          fi
+
+          printf '%s\n' "${ZIG_DIR}" >> "${GITHUB_PATH}"
 
       - name: Prepare release signing key
         env:
