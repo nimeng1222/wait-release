@@ -79,12 +79,12 @@ jobs:
           fi
 
       - name: Checkout release orchestration
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: wait-release
 
       - name: Checkout wait-monitor
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: nimeng1222/wait-monitor
           ref: ${{ inputs.main_ref }}
@@ -93,7 +93,7 @@ jobs:
           fetch-depth: 0
 
       - name: Checkout wait-agent
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: nimeng1222/wait-agent
           ref: ${{ inputs.agent_ref }}
@@ -102,7 +102,7 @@ jobs:
           fetch-depth: 0
 
       - name: Checkout frontend
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ inputs.web_repository }}
           ref: ${{ inputs.web_ref }}
@@ -121,7 +121,7 @@ jobs:
           fi
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: "1.25.0"
           cache-dependency-path: |
@@ -129,7 +129,7 @@ jobs:
             wait-agent-main/go.sum
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: "22"
           cache: npm
@@ -160,6 +160,15 @@ jobs:
           set -euo pipefail
           bash wait-release/release-unified.sh
 
+      - name: Debug release-output paths
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "workspace: ${GITHUB_WORKSPACE}"
+          ls -la "${GITHUB_WORKSPACE}" || true
+          ls -la "${GITHUB_WORKSPACE}/release-output" || true
+          ls -la "${GITHUB_WORKSPACE}/wait-release/release-output" || true
+
       - name: Verify generated signatures
         run: |
           set -euo pipefail
@@ -173,8 +182,11 @@ jobs:
 
       - name: Upload release-output artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: release-output
-          path: release-output
+          path: |
+            ${{ github.workspace }}/release-output
+            ${{ github.workspace }}/wait-release/release-output
           retention-days: 14
+          if-no-files-found: ignore
