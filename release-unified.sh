@@ -408,8 +408,36 @@ mkdir -p "${OUT_DIR}" "${STAGING_ROOT}"
 rm -rf "${MAIN_BUILD_DIR}" "${AGENT_BUILD_DIR}" "${WEB_BUILD_DIR}" "${OUT_DIR}/.staging"
 mkdir -p "${MAIN_BUILD_DIR}" "${AGENT_BUILD_DIR}" "${WEB_BUILD_DIR}"
 
+# --- 质量门：发布前强制运行测试与静态分析 ---
+# 设置 SKIP_QUALITY_GATE=1 可在紧急情况下绕过（不推荐）。
+if [ "${SKIP_QUALITY_GATE:-0}" != "1" ]; then
+  printf '\n==> [0/6] Quality gate (go test/vet/staticcheck)\n'
+
+  printf '  wait-main: go vet + go test\n'
+  (cd "${MAIN_DIR}" && go vet ./... && go test ./...)
+
+  printf '  wait-agent-main: go vet + go test\n'
+  (cd "${AGENT_DIR}" && go vet ./... && go test ./...)
+
+  # staticcheck 可选：未安装则跳过，已安装则强制通过。
+  if command -v staticcheck >/dev/null 2>&1; then
+    printf '  staticcheck (detected): running on both Go modules\n'
+    (cd "${MAIN_DIR}" && staticcheck ./...)
+    (cd "${AGENT_DIR}" && staticcheck ./...)
+  else
+    printf '  staticcheck: not installed, skipped (install with: go install honnef.co/go/tools/cmd/staticcheck@latest)\n'
+  fi
+else
+  printf '\n==> [0/6] Quality gate SKIPPED (SKIP_QUALITY_GATE=1)\n'
+fi
+
 printf '\n==> [1/6] Build web dist\n'
 npm ci --prefix "${WEB_DIR}"
+if [ "${SKIP_QUALITY_GATE:-0}" != "1" ]; then
+  printf '  wait-web-next: lint + unit tests\n'
+  npm run lint --prefix "${WEB_DIR}"
+  npm run test:unit --prefix "${WEB_DIR}"
+fi
 npm run build --prefix "${WEB_DIR}"
 
 printf '\n==> [2/6] Build wait-main in staging workspace\n'
@@ -433,9 +461,9 @@ for target in "${MAIN_TARGETS[@]}"; do
   BIN_NAME="wait-${GOOS}-${GOARCH}"
   echo "Building ${BIN_NAME}"
   case "${GOARCH}" in
-    amd64) ZIG_TARGET="x86_64-linux-gnu" ;;
-    arm64) ZIG_TARGET="aarch64-linux-gnu" ;;
-    *) ZIG_TARGET="${GOARCH}-linux-gnu" ;;
+    amd64) ZIG_TARGET="x86_64-linux-musl" ;;
+    arm64) ZIG_TARGET="aarch64-linux-musl" ;;
+    *) ZIG_TARGET="${GOARCH}-linux-musl" ;;
   esac
   (
     cd "${MAIN_STAGING_DIR}"

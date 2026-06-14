@@ -9,7 +9,10 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 RELEASE_REPO_URL="${WAIT_AGENT_RELEASE_REPO_URL:-https://github.com/nimeng1222/wait-release/releases}"
+# 跳过 SHA-256 完整性校验。
 SKIP_CHECKSUM_VERIFY="${WAIT_AGENT_SKIP_CHECKSUM:-0}"
+# 跳过 ECDSA 签名校验（独立于 checksum）。
+SKIP_SIGNATURE_VERIFY="${WAIT_AGENT_SKIP_SIGNATURE:-0}"
 RELEASE_PUBKEY_PEM='-----BEGIN PUBLIC KEY-----
 MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE29f9FZIEMzvfTiaJGd6zPgpOZnIL
 jndWyXnh3jM+TWNVvBarlcPGAEDxmIQAAYel8QIDJgzIs7xSKE9oLtvmmg==
@@ -19,6 +22,14 @@ log_info()  { echo -e "${NC}$1"; }
 log_ok()    { echo -e "${GREEN}  ✓  $1${NC}"; }
 log_err()   { echo -e "${RED}  ✗  $1${NC}"; }
 log_step()  { echo -e "${CYAN}▸  ${NC}$1"; }
+
+# 弃用提示：旧名 WAIT_AGENT_SKIP_CHECKSUM 在历史实现中会连带跳过签名校验，
+# 现已拆分。此处仅打印提示，实际跳过行为见 verify_downloaded_release_file。
+if [ "${WAIT_AGENT_SKIP_CHECKSUM:-}" = "1" ]; then
+    log_err "⚠️ WAIT_AGENT_SKIP_CHECKSUM 已弃用：旧实现会同时跳过 checksum 与签名校验。"
+    log_err "   现已拆分为独立变量：WAIT_AGENT_SKIP_CHECKSUM=1 仅跳过完整性校验，"
+    log_err "   若还需跳过签名校验，请额外设置 WAIT_AGENT_SKIP_SIGNATURE=1。"
+fi
 
 usage() {
     cat << EOF
@@ -150,6 +161,16 @@ verify_downloaded_release_file() {
     local file_path="$1"
     local file_name="$2"
 
+    # --- ECDSA 签名校验（独立控制） ---
+    if [ "$SKIP_SIGNATURE_VERIFY" = "1" ]; then
+        log_err "高危：WAIT_AGENT_SKIP_SIGNATURE=1，已跳过 ECDSA 签名校验"
+    else
+        if ! verify_release_signature "$file_path" "$file_name"; then
+            return 1
+        fi
+    fi
+
+    # --- SHA-256 完整性校验（独立控制） ---
     if [ "$SKIP_CHECKSUM_VERIFY" = "1" ]; then
         log_err "高危：WAIT_AGENT_SKIP_CHECKSUM=1，已跳过二进制完整性校验"
         return 0
@@ -168,10 +189,6 @@ verify_downloaded_release_file() {
 
     if [ -z "$expected_hash" ]; then
         log_err "${file_name}.sha256 内容无效"
-        return 1
-    fi
-
-    if ! verify_release_signature "$file_path" "$file_name"; then
         return 1
     fi
 

@@ -123,7 +123,8 @@ Agent 安装脚本：
 | 变量 | 说明 |
 | --- | --- |
 | `WAIT_AGENT_RELEASE_REPO_URL` | Agent 二进制下载源，默认使用本仓库 release |
-| `WAIT_AGENT_SKIP_CHECKSUM` | 设置为 `1` 会跳过 Agent 校验，不推荐，仅用于紧急排障 |
+| `WAIT_AGENT_SKIP_CHECKSUM` | （已弃用）设置为 `1` 跳过 SHA-256 完整性校验，不推荐，仅用于紧急排障。旧实现会连带跳过签名校验，现已拆分为独立变量。 |
+| `WAIT_AGENT_SKIP_SIGNATURE` | 设置为 `1` 跳过 ECDSA 签名校验，与 `WAIT_AGENT_SKIP_CHECKSUM` 独立。不推荐，仅用于紧急排障。 |
 
 ## 常用运维命令
 
