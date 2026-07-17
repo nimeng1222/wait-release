@@ -215,7 +215,7 @@ nimeng1222/wait-release -> Actions -> Unified Release -> Run workflow
 | `allow_release_clobber` | `false` | 默认禁止覆盖已有 release 资产 |
 | `main_version` / `agent_version` | 空 | 显式指定版本时使用，例如 `v0.1.35` |
 
-workflow 会固定使用 Node 22、Go 1.25 和已验证签名的 Zig 0.14.1，构建完成后会验签 `SHA256SUMS.txt`、主控二进制和 agent 二进制，并把 `release-output` 作为短期 artifact 留档。
+workflow 会固定使用 Node 22、Go 1.26.4 和已验证签名的 Zig 0.14.1，构建完成后会验签 `SHA256SUMS.txt`、主控二进制和 agent 二进制，并把 `release-output` 作为短期 artifact 留档。
 
 ## 安全说明
 
