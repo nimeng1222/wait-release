@@ -51,7 +51,7 @@ fi
 info()    { echo -e "${NC}$1${NC}"; }
 ok()      { echo -e "${GREEN}  ✓  $1${NC}"; }
 warn()    { echo -e "${YELLOW}  ⚠  $1${NC}"; }
-err()     { echo -e "${RED}  ✗  $1${NC}"; }
+err()     { echo -e "${RED}  ✗  $1${NC}" >&2; }
 step()    { echo -e "${CYAN}${BOLD}▸${NC} ${BOLD}$1${NC}"; }
 divider() { echo -e "${CYAN}──────────────────────────────────────────────────────${NC}"; }
 
@@ -371,10 +371,14 @@ detect_arch() {
     local arch
     arch="$(uname -m)"
     case $arch in
-        x86_64)  echo "amd64" ;;
-        aarch64) echo "arm64" ;;
-        i386|i686) echo "386" ;;
-        riscv64) echo "riscv64" ;;
+        x86_64|amd64)  echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        i386|i686|riscv64)
+            # 构建矩阵只产 amd64/arm64（review-P3 #55），这两个架构没有对应 release
+            # 资产，原实现会静默走到 404。改成明确报错，给用户清晰提示。
+            err "架构 $arch 暂不支持（当前仅提供 amd64/arm64 预编译二进制）。如需支持请到 GitHub 提 issue。"
+            exit 1
+            ;;
         *) err "不支持的架构: $arch"; exit 1 ;;
     esac
 }
