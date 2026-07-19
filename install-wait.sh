@@ -302,10 +302,15 @@ select_runtime_identity() {
 
 prepare_runtime_paths() {
     mkdir -p "$INSTALL_DIR" "$SERVICE_DATA_DIR"
-    chmod 700 "$INSTALL_DIR"
     if [ "$RUNTIME_USER" != "root" ]; then
+        # 运行用户非 root：必须让它对 INSTALL_DIR 有进入权限，
+        # 否则 systemd 的 WorkingDirectory 会因 EACCES 直接退出 (status=200/CHDIR)。
+        chown "$RUNTIME_USER:$RUNTIME_GROUP" "$INSTALL_DIR"
+        chmod 750 "$INSTALL_DIR"
         chown -R "$RUNTIME_USER:$RUNTIME_GROUP" "$SERVICE_DATA_DIR"
         chmod 750 "$SERVICE_DATA_DIR"
+    else
+        chmod 700 "$INSTALL_DIR"
     fi
 }
 
