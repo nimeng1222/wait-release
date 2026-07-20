@@ -9,9 +9,14 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 RELEASE_REPO_URL="${WAIT_AGENT_RELEASE_REPO_URL:-https://github.com/nimeng1222/wait-release/releases}"
-# 跳过 SHA-256 完整性校验。
+# review M7：收紧校验绕过。原实现 WAIT_AGENT_SKIP_SIGNATURE=1 即可装未签名二进制，
+# 与 install-wait.sh（不可绕过）行为不一致。现引入 ALLOW_UNSAFE_SKIP 双重确认：
+# 默认 0，即便用户设了 SKIP_*_VERIFY=1 也会被硬拒绝；仅在显式
+# WAIT_ALLOW_UNSAFE_SKIP=1（CI debug 场景）时才允许跳过。
+ALLOW_UNSAFE_SKIP="${WAIT_ALLOW_UNSAFE_SKIP:-0}"
+# 跳过 SHA-256 完整性校验（仅当 ALLOW_UNSAFE_SKIP=1 时生效）。
 SKIP_CHECKSUM_VERIFY="${WAIT_AGENT_SKIP_CHECKSUM:-0}"
-# 跳过 ECDSA 签名校验（独立于 checksum）。
+# 跳过 ECDSA 签名校验（独立于 checksum，仅当 ALLOW_UNSAFE_SKIP=1 时生效）。
 SKIP_SIGNATURE_VERIFY="${WAIT_AGENT_SKIP_SIGNATURE:-0}"
 RELEASE_PUBKEY_PEM='-----BEGIN PUBLIC KEY-----
 MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE29f9FZIEMzvfTiaJGd6zPgpOZnIL
@@ -20,7 +25,7 @@ jndWyXnh3jM+TWNVvBarlcPGAEDxmIQAAYel8QIDJgzIs7xSKE9oLtvmmg==
 
 log_info()  { echo -e "${NC}$1"; }
 log_ok()    { echo -e "${GREEN}  ✓  $1${NC}"; }
-log_err()   { echo -e "${RED}  ✗  $1${NC}"; }
+log_err()   { echo -e "${RED}  ✗  $1${NC}" >&2; }
 log_step()  { echo -e "${CYAN}▸  ${NC}$1"; }
 
 # 弃用提示：旧名 WAIT_AGENT_SKIP_CHECKSUM 在历史实现中会连带跳过签名校验，
@@ -29,6 +34,10 @@ if [ "${WAIT_AGENT_SKIP_CHECKSUM:-}" = "1" ]; then
     log_err "⚠️ WAIT_AGENT_SKIP_CHECKSUM 已弃用：旧实现会同时跳过 checksum 与签名校验。"
     log_err "   现已拆分为独立变量：WAIT_AGENT_SKIP_CHECKSUM=1 仅跳过完整性校验，"
     log_err "   若还需跳过签名校验，请额外设置 WAIT_AGENT_SKIP_SIGNATURE=1。"
+    if [ "$ALLOW_UNSAFE_SKIP" != "1" ]; then
+        log_err "   检测到 SKIP_* 请求但未设 WAIT_ALLOW_UNSAFE_SKIP=1，默认拒绝以防止误用。"
+        exit 1
+    fi
 fi
 
 usage() {
@@ -163,6 +172,10 @@ verify_downloaded_release_file() {
 
     # --- ECDSA 签名校验（独立控制） ---
     if [ "$SKIP_SIGNATURE_VERIFY" = "1" ]; then
+        if [ "$ALLOW_UNSAFE_SKIP" != "1" ]; then
+            log_err "拒绝：WAIT_AGENT_SKIP_SIGNATURE=1 但未设 WAIT_ALLOW_UNSAFE_SKIP=1，已中止"
+            return 1
+        fi
         log_err "高危：WAIT_AGENT_SKIP_SIGNATURE=1，已跳过 ECDSA 签名校验"
     else
         if ! verify_release_signature "$file_path" "$file_name"; then
@@ -172,6 +185,10 @@ verify_downloaded_release_file() {
 
     # --- SHA-256 完整性校验（独立控制） ---
     if [ "$SKIP_CHECKSUM_VERIFY" = "1" ]; then
+        if [ "$ALLOW_UNSAFE_SKIP" != "1" ]; then
+            log_err "拒绝：WAIT_AGENT_SKIP_CHECKSUM=1 但未设 WAIT_ALLOW_UNSAFE_SKIP=1，已中止"
+            return 1
+        fi
         log_err "高危：WAIT_AGENT_SKIP_CHECKSUM=1，已跳过二进制完整性校验"
         return 0
     fi

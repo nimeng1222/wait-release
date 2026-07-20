@@ -56,7 +56,7 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
       ROOT_DIR: ${{ github.workspace }}
       OUT_DIR: ${{ github.workspace }}/release-output
-      WAIT_RELEASE_SIGNING_KEY: ${{ github.workspace }}/.wait-release-signing-key.pem
+      WAIT_RELEASE_SIGNING_KEY: ${{ github.workspace }}/.release-secrets/.wait-release-signing-key.pem
       GH_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
       PUBLISH_RELEASES: ${{ inputs.publish_releases && '1' || '0' }}
       REUSE_RELEASE_VERSIONS: ${{ inputs.reuse_release_versions && '1' || '0' }}
@@ -135,31 +135,33 @@ jobs:
           cache: npm
           cache-dependency-path: wait-web-next/package-lock.json
 
-      - name: Install Zig toolchain
+      - name: Install Zig cross-compiler toolchain
         run: |
           set -euo pipefail
           ZIG_VERSION="0.14.1"
+          ZIG_TARBALL="zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
 
+          # 供应链信任（review H1）：原实现从 PyPI 拉 ziglang 包且无完整性校验，
+          # 改为官方 tarball + minisign 固定公钥校验，与 build.yml 保持一致。
+          # 签名只证明"由本脚本产出"，工具链自身可信度必须从源头绑定。
           sudo apt-get update
-          sudo apt-get install -y build-essential python3-pip
-
-          python3 -m pip install --user --break-system-packages --only-binary=:all: "ziglang==${ZIG_VERSION}"
-          ZIG_DIR="$(python3 - <<'PY'
-          import pathlib
-          import ziglang
-
-          print(pathlib.Path(ziglang.__file__).resolve().parent)
-          PY
-          )"
-          chmod +x "${ZIG_DIR}/zig"
-          printf '%s\n' "${ZIG_DIR}" >> "${GITHUB_PATH}"
-          "${ZIG_DIR}/zig" version
+          sudo apt-get install -y build-essential curl minisign xz-utils
+          curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSLO "https://ziglang.org/download/${ZIG_VERSION}/${ZIG_TARBALL}"
+          curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSLO "https://ziglang.org/download/${ZIG_VERSION}/${ZIG_TARBALL}.minisig"
+          minisign -Vm "${ZIG_TARBALL}" -P "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U"
+          sudo tar -C /usr/local -Jxf "${ZIG_TARBALL}"
+          printf '%s\n' "/usr/local/zig-x86_64-linux-${ZIG_VERSION}" >> "${GITHUB_PATH}"
+          "/usr/local/zig-x86_64-linux-${ZIG_VERSION}/zig" version
 
       - name: Prepare release signing key
         env:
           WAIT_RELEASE_SIGNING_KEY_PEM: ${{ secrets.WAIT_RELEASE_SIGNING_KEY_PEM }}
         run: |
           set -euo pipefail
+          # 密钥改写到 .release-secrets/（被根 .gitignore 覆盖）+ 受 umask 077 保护，
+          # 配合末尾的 cleanup 步骤避免 runner 复用导致密钥泄漏。
+          mkdir -p "${GITHUB_WORKSPACE}/.release-secrets"
+          chmod 700 "${GITHUB_WORKSPACE}/.release-secrets"
           umask 077
           printf '%s\n' "${WAIT_RELEASE_SIGNING_KEY_PEM}" > "${WAIT_RELEASE_SIGNING_KEY}"
           openssl pkey -in "${WAIT_RELEASE_SIGNING_KEY}" -noout
@@ -199,3 +201,12 @@ jobs:
             ${{ github.workspace }}/wait-release/release-output
           retention-days: 14
           if-no-files-found: ignore
+
+      - name: Cleanup signing key
+        if: always()
+        run: |
+          set -euo pipefail
+          # review M3：密钥物化到 runner 文件系统后必须擦除，避免 runner 复用泄漏。
+          # 用 if: always() 保证即使前面步骤失败也会执行。
+          rm -f "${WAIT_RELEASE_SIGNING_KEY}"
+          rmdir "${GITHUB_WORKSPACE}/.release-secrets" 2>/dev/null || true
