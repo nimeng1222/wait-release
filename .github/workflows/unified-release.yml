@@ -11,10 +11,6 @@ on:
         description: wait-agent branch, tag, or SHA to release
         required: true
         default: main
-      web_repository:
-        description: Frontend repository owner/name
-        required: true
-        default: nimeng1222/wait-web-next
       web_ref:
         description: Frontend branch, tag, or SHA to embed
         required: true
@@ -56,23 +52,54 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
       ROOT_DIR: ${{ github.workspace }}
       OUT_DIR: ${{ github.workspace }}/release-output
-      WAIT_RELEASE_SIGNING_KEY: ${{ github.workspace }}/.release-secrets/.wait-release-signing-key.pem
-      GH_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
+      WAIT_RELEASE_SIGNING_KEY: ${{ inputs.publish_releases && format('{0}/.release-secrets/.wait-release-signing-key.pem', github.workspace) || '' }}
       PUBLISH_RELEASES: ${{ inputs.publish_releases && '1' || '0' }}
       REUSE_RELEASE_VERSIONS: ${{ inputs.reuse_release_versions && '1' || '0' }}
       ALLOW_RELEASE_CLOBBER: ${{ inputs.allow_release_clobber && '1' || '0' }}
 
     steps:
-      - name: Validate required secrets
+      - name: Validate inputs and checkout secret
         env:
+          MAIN_REF: ${{ inputs.main_ref }}
+          AGENT_REF: ${{ inputs.agent_ref }}
+          WEB_REF: ${{ inputs.web_ref }}
+          MAIN_VERSION_INPUT: ${{ inputs.main_version }}
+          AGENT_VERSION_INPUT: ${{ inputs.agent_version }}
           RELEASE_GITHUB_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
-          WAIT_RELEASE_SIGNING_KEY_PEM: ${{ secrets.WAIT_RELEASE_SIGNING_KEY_PEM }}
         run: |
           set -euo pipefail
+          validate_ref() {
+            local label="$1"
+            local value="$2"
+            if [[ "${value}" != "main" && ! "${value}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ && ! "${value}" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "${label} must be main, an exact semver tag, or a full 40-character commit SHA" >&2
+              exit 1
+            fi
+          }
+          validate_version() {
+            local label="$1"
+            local value="$2"
+            if [[ -n "${value}" && ! "${value}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "${label} must be empty or an exact semantic version such as v1.2.3" >&2
+              exit 1
+            fi
+          }
+          validate_ref MAIN_REF "${MAIN_REF}"
+          validate_ref AGENT_REF "${AGENT_REF}"
+          validate_ref WEB_REF "${WEB_REF}"
+          validate_version MAIN_VERSION_INPUT "${MAIN_VERSION_INPUT}"
+          validate_version AGENT_VERSION_INPUT "${AGENT_VERSION_INPUT}"
           if [ -z "${RELEASE_GITHUB_TOKEN}" ]; then
             echo "Missing secret RELEASE_GITHUB_TOKEN" >&2
             exit 1
           fi
+
+      - name: Validate release signing secret
+        if: inputs.publish_releases
+        env:
+          WAIT_RELEASE_SIGNING_KEY_PEM: ${{ secrets.WAIT_RELEASE_SIGNING_KEY_PEM }}
+        run: |
+          set -euo pipefail
           if [ -z "${WAIT_RELEASE_SIGNING_KEY_PEM}" ]; then
             echo "Missing secret WAIT_RELEASE_SIGNING_KEY_PEM" >&2
             exit 1
@@ -82,6 +109,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           path: wait-release
+          persist-credentials: false
 
       - name: Checkout wait-monitor
         uses: actions/checkout@v6
@@ -91,6 +119,7 @@ jobs:
           token: ${{ secrets.RELEASE_GITHUB_TOKEN }}
           path: wait-main
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Checkout wait-agent
         uses: actions/checkout@v6
@@ -100,30 +129,53 @@ jobs:
           token: ${{ secrets.RELEASE_GITHUB_TOKEN }}
           path: wait-agent-main
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Checkout frontend
         uses: actions/checkout@v6
         with:
-          repository: ${{ inputs.web_repository }}
+          repository: nimeng1222/wait-web-next
           ref: ${{ inputs.web_ref }}
           token: ${{ secrets.RELEASE_GITHUB_TOKEN }}
           path: wait-web-next
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Set explicit versions
+      - name: Resolve release versions
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
+          MAIN_VERSION_INPUT: ${{ inputs.main_version }}
+          AGENT_VERSION_INPUT: ${{ inputs.agent_version }}
         run: |
           set -euo pipefail
-          if [ -n "${{ inputs.main_version }}" ]; then
-            printf 'MAIN_VERSION=%s\n' "${{ inputs.main_version }}" >> "${GITHUB_ENV}"
+          latest_version() {
+            local repo="$1"
+            local tags
+            if ! tags="$(gh api --paginate "repos/${repo}/tags?per_page=100" --jq '.[].name')"; then
+              echo "Failed to list tags for ${repo}" >&2
+              return 1
+            fi
+            printf '%s\n' "${tags}" \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V \
+              | tail -n 1 \
+              | sed 's/^v//' || true
+          }
+          main_current_version="$(latest_version nimeng1222/wait-monitor)"
+          agent_current_version="$(latest_version nimeng1222/wait-agent)"
+          printf 'CURRENT_MAIN_VERSION=%s\n' "${main_current_version}" >> "${GITHUB_ENV}"
+          printf 'CURRENT_AGENT_VERSION=%s\n' "${agent_current_version}" >> "${GITHUB_ENV}"
+          if [ -n "${MAIN_VERSION_INPUT}" ]; then
+            printf 'MAIN_VERSION=%s\n' "${MAIN_VERSION_INPUT}" >> "${GITHUB_ENV}"
           fi
-          if [ -n "${{ inputs.agent_version }}" ]; then
-            printf 'AGENT_VERSION=%s\n' "${{ inputs.agent_version }}" >> "${GITHUB_ENV}"
+          if [ -n "${AGENT_VERSION_INPUT}" ]; then
+            printf 'AGENT_VERSION=%s\n' "${AGENT_VERSION_INPUT}" >> "${GITHUB_ENV}"
           fi
 
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: "1.26.4"
+          go-version: "1.26.5"
           cache-dependency-path: |
             wait-main/go.sum
             wait-agent-main/go.sum
@@ -131,7 +183,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v5
         with:
-          node-version: "22"
+          node-version: "22.22.0"
           cache: npm
           cache-dependency-path: wait-web-next/package-lock.json
 
@@ -153,7 +205,18 @@ jobs:
           printf '%s\n' "/usr/local/zig-x86_64-linux-${ZIG_VERSION}" >> "${GITHUB_PATH}"
           "/usr/local/zig-x86_64-linux-${ZIG_VERSION}/zig" version
 
+      - name: Test and build without release secrets
+        run: |
+          set -euo pipefail
+          (cd wait-main && go vet ./... && go test ./...)
+          (cd wait-agent-main && go vet ./... && go test ./...)
+          npm ci --prefix wait-web-next
+          npm run lint --prefix wait-web-next
+          npm run test:unit --prefix wait-web-next
+          npm run build --prefix wait-web-next
+
       - name: Prepare release signing key
+        if: inputs.publish_releases
         env:
           WAIT_RELEASE_SIGNING_KEY_PEM: ${{ secrets.WAIT_RELEASE_SIGNING_KEY_PEM }}
         run: |
@@ -167,6 +230,11 @@ jobs:
           openssl pkey -in "${WAIT_RELEASE_SIGNING_KEY}" -noout
 
       - name: Build, sign, and publish
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
+          SKIP_QUALITY_GATE: "1"
+          SKIP_WEB_BUILD: "1"
+          SKIP_REMOTE_COMMIT_CHECK: "1"
         run: |
           set -euo pipefail
           bash wait-release/release-unified.sh
@@ -203,7 +271,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Cleanup signing key
-        if: always()
+        if: always() && inputs.publish_releases
         run: |
           set -euo pipefail
           # review M3：密钥物化到 runner 文件系统后必须擦除，避免 runner 复用泄漏。

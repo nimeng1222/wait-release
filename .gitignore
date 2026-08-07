@@ -2,3 +2,6 @@
 # review M3：CI 写入的签名私钥落在此目录下，必须从不被提交。
 .release-secrets/
 release-output/
+
+# macOS
+.DS_Store

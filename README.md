@@ -183,14 +183,14 @@ sudo bash install-wait.sh
    nimeng1222/wait-web-next
    ```
 
-   如果前端仓库名称不同，手动触发 workflow 时修改 `web_repository` 输入。
+   前端仓库固定为 `nimeng1222/wait-web-next`；workflow 不接受任意仓库名称输入。
 
 2. 在 `nimeng1222/wait-release` 仓库配置以下 Secrets：
 
    | Secret | 说明 |
    | --- | --- |
-   | `WAIT_RELEASE_SIGNING_KEY_PEM` | ECDSA release 签名私钥 PEM 内容，必须匹配安装脚本内置公钥 |
-   | `RELEASE_GITHUB_TOKEN` | 用于 checkout 源码仓库并创建三个 GitHub Release 的 token |
+   | `WAIT_RELEASE_SIGNING_KEY_PEM` | 仅正式发布需要。ECDSA release 签名私钥 PEM 内容，必须匹配安装脚本内置公钥 |
+   | `RELEASE_GITHUB_TOKEN` | 用于 checkout 源码仓库并创建四个 GitHub Release（分布在三个仓库）的 token |
 
    `RELEASE_GITHUB_TOKEN` 至少需要能读取 `wait-monitor`、`wait-agent`、前端仓库，并能对 `wait-monitor`、`wait-agent`、`wait-release` 创建 Release / 上传资产。Fine-grained PAT 推荐授予这些仓库的 `Contents: Read and write` 权限；classic PAT 可使用 `repo` scope。
 
@@ -208,20 +208,19 @@ nimeng1222/wait-release -> Actions -> Unified Release -> Run workflow
 | --- | --- | --- |
 | `main_ref` | `main` | 要发布的 `wait-monitor` ref |
 | `agent_ref` | `main` | 要发布的 `wait-agent` ref |
-| `web_repository` | `nimeng1222/wait-web-next` | 前端源码仓库 |
 | `web_ref` | `main` | 要嵌入的前端 ref |
-| `publish_releases` | `true` | 设为 `false` 时只 dry-run 构建并上传 `release-output` artifact |
+| `publish_releases` | `true` | 设为 `false` 时只 dry-run 构建并上传 `release-output` artifact；不读取正式签名私钥，而是生成一次性临时密钥供产物自检 |
 | `reuse_release_versions` | `false` | 默认自动 patch +1；设为 `true` 时复用当前版本 |
 | `allow_release_clobber` | `false` | 默认禁止覆盖已有 release 资产 |
 | `main_version` / `agent_version` | 空 | 显式指定版本时使用，例如 `v0.1.35` |
 
-workflow 会固定使用 Node 22、Go 1.26.4 和已验证签名的 Zig 0.14.1，构建完成后会验签 `SHA256SUMS.txt`、主控二进制和 agent 二进制，并把 `release-output` 作为短期 artifact 留档。
+workflow 会固定使用 Node 22、Go 1.26.5 和已验证签名的 Zig 0.14.1，构建完成后会验签 `SHA256SUMS.txt`、主控二进制和 agent 二进制，并把 `release-output` 作为短期 artifact 留档。
 
 ## 安全说明
 
 - 请优先使用 HTTPS 下载脚本和 release 资产。
 - 不建议跳过 SHA-256 校验。
-- 如需使用低于 `1024` 的端口，脚本会尝试使用 `setcap` 让非 root 服务绑定端口；如果系统不支持，可能回退为 root 运行。
+- 如需使用低于 `1024` 的端口，脚本会通过 systemd 的 `AmbientCapabilities=CAP_NET_BIND_SERVICE` 授权专用服务用户绑定端口。
 - 升级主控时脚本会先备份当前二进制；新版本下载、校验、兼容性检查或启动失败时会尝试回滚。
 
 ## English

@@ -68,6 +68,9 @@ append_asset_if_exists() {
     PUBLIC_ASSETS)
       PUBLIC_ASSETS+=("${value}")
       ;;
+    PUBLIC_AGENT_ASSETS)
+      PUBLIC_AGENT_ASSETS+=("${value}")
+      ;;
     *)
       echo "ERROR: unsupported asset array ${array_name}" >&2
       exit 1
@@ -75,12 +78,41 @@ append_asset_if_exists() {
   esac
 }
 
+# upload_release_assets 发布（或补传）一个 release。
+#
+# 第 4 个参数是 target commitish：gh release create 不带 --target 时，会用**默认分支
+# 当前的 HEAD** 来打 tag，而不是我们实际编译的那个 commit。unified-release.yml 允许
+# 传入 branch/tag/SHA 作为 main_ref，加上 main 随时可能在 checkout 与 publish 之间前进，
+# 于是 tag 和 PROVENANCE.json 记录的 commit 会对不上 —— `git checkout <tag> && go build`
+# 复现不出发布的二进制。review-2026-07-26 P1-14
 upload_release_assets() {
   local repo="$1"
   local tag="$2"
   local notes="$3"
-  shift 3
+  local target="$4"
+  local latest="$5"
+  shift 5
   local assets=("$@")
+
+  local target_args=()
+  if [ -n "${target}" ]; then
+    target_args=(--target "${target}")
+  fi
+
+  # 第 5 个参数显式决定这个 release 是不是 GitHub 的 "Latest"。
+  #
+  # 不能依赖 gh 的默认（"automatic based on date and version"）：公开镜像仓库里
+  # 同时有主控和 agent 两条独立递增的版本线，一旦 agent 的版本号超过主控，
+  # agent 的镜像 release 就会抢走 Latest —— 而 install-wait.sh 与 install-agent.sh
+  # 都靠 /releases/latest/download/<asset> 取资产，主控安装器会立刻 404。
+  # review-2026-07-26 复审
+  local latest_args=()
+  case "${latest}" in
+    true)  latest_args=(--latest) ;;
+    false) latest_args=(--latest=false) ;;
+    "")    ;;
+    *)     echo "ERROR: upload_release_assets latest must be true/false/empty, got '${latest}'" >&2; exit 1 ;;
+  esac
 
   local release_exists=0
   if gh release view "${tag}" --repo "${repo}" >/dev/null 2>&1; then
@@ -88,8 +120,16 @@ upload_release_assets() {
   fi
 
   if [ "${release_exists}" -eq 0 ]; then
-    echo "Creating release ${tag} in ${repo}"
-    gh release create "${tag}" "${assets[@]}" --repo "${repo}" --title "Release ${tag}" --notes "${notes}"
+    echo "Creating release ${tag} in ${repo} at ${target:-<default branch>}"
+    # 数组一律用 "${arr[@]+"${arr[@]}"}" 展开，不能直接写 "${arr[@]}"。
+    #
+    # macOS 自带的是 bash 3.2.57，在 `set -u` 下把**空数组**的 "${arr[@]}" 判为
+    # unbound variable 并直接退出；bash 4.4+ 才把空数组视为已定义。target_args 与
+    # latest_args 在多数调用下正好是空的（私有仓库不传 --latest，镜像仓库不传
+    # --target），于是脚本在 macOS 上会死在第一次发布调用处，根本发不了版。
+    # `${arr[@]+...}` 的 `+` 展开在数组为空时整体消失，两个版本的 bash 行为一致。
+    # review-2026-07-27 H-1
+    gh release create "${tag}" "${assets[@]+"${assets[@]}"}" --repo "${repo}" --title "Release ${tag}" --notes "${notes}" "${target_args[@]+"${target_args[@]}"}" "${latest_args[@]+"${latest_args[@]}"}"
     return
   fi
 
@@ -99,7 +139,33 @@ upload_release_assets() {
   fi
 
   echo "Updating existing release ${tag} in ${repo} with ALLOW_RELEASE_CLOBBER=1"
-  gh release upload "${tag}" "${assets[@]}" --repo "${repo}" --clobber
+  gh release upload "${tag}" "${assets[@]+"${assets[@]}"}" --repo "${repo}" --clobber
+  # gh release upload 没有 --latest 标志，而 upload 不改变 release 现有的 latest 状态：
+  # 若 agent 镜像 release 之前已被标成 Latest，clobber 重发不会纠正，latest/download
+  # 仍会指向 agent tag，两个安装脚本随即 404。用 gh release edit 把 latest 状态补正到
+  # 与正常创建路径（上面的 latest_args）一致。review-2026-07-27
+  if [ -n "${latest}" ]; then
+    gh release edit "${tag}" --repo "${repo}" --latest="${latest}"
+  fi
+}
+
+# assert_release_absent 在**发布任何东西之前**确认目标 release 槽位是空的。
+#
+# upload_release_assets 自己也会检查，但那是逐个检查、边查边发：第 3 个目标撞车时，
+# 前 2 个已经发出去了 —— 留下一个发了一半的版本。这里把全部 4 个槽位一次性查完，
+# 让"要么全发，要么一个都不发"成为默认行为。review-2026-07-27 H-2
+assert_release_absent() {
+  local repo="$1"
+  local tag="$2"
+  if [ "${ALLOW_RELEASE_CLOBBER}" = "1" ]; then
+    return
+  fi
+  if gh release view "${tag}" --repo "${repo}" >/dev/null 2>&1; then
+    echo "ERROR: release ${tag} already exists in ${repo}." >&2
+    echo "       Refusing to start publishing, otherwise earlier repos would be left half-published." >&2
+    echo "       Publish a new version tag, or set ALLOW_RELEASE_CLOBBER=1 to overwrite deliberately." >&2
+    exit 1
+  fi
 }
 
 write_go_module_inventory() {
@@ -135,13 +201,15 @@ write_provenance_metadata() {
   local output_path="$1"
   local node_version
   local npm_version
-  local go_version
+  local main_go_version
+  local agent_go_version
   local web_revision
   node_version="$(node -v)"
   npm_version="$(npm -v)"
-  go_version="$(go version)"
+  main_go_version="$(cd "${MAIN_DIR}" && go env GOVERSION)"
+  agent_go_version="$(cd "${AGENT_DIR}" && go env GOVERSION)"
   if [ -d "${WEB_DIR}/.git" ]; then
-    web_revision="$(git -C "${WEB_DIR}" rev-parse --short HEAD 2>/dev/null || true)"
+    web_revision="${WEB_COMMIT:-$(git -C "${WEB_DIR}" rev-parse HEAD 2>/dev/null || true)}"
   else
     web_revision="workspace"
   fi
@@ -164,12 +232,13 @@ write_provenance_metadata() {
       "commit": "$(git -C "${AGENT_DIR}" rev-parse HEAD)"
     },
     "wait_web_next": {
-      "repo": "workspace",
+      "repo": "nimeng1222/wait-web-next",
       "revision": "${web_revision}"
     }
   },
   "toolchain": {
-    "go": "${go_version}",
+    "go_wait_main": "${main_go_version}",
+    "go_wait_agent": "${agent_go_version}",
     "node": "${node_version}",
     "npm": "${npm_version}"
   },
@@ -281,10 +350,6 @@ prepare_release_signing_key() {
 
 write_release_public_key() {
   local output_path="$1"
-  if [ "${RELEASE_SIGNING_MODE}" = "dry-run-temporary" ]; then
-    trusted_release_public_key_path "${output_path}"
-    return
-  fi
   openssl pkey -in "${RELEASE_SIGNING_KEY}" -pubout -out "${output_path}" >/dev/null
 }
 
@@ -352,13 +417,35 @@ else
   MAIN_VERSION="${MAIN_VERSION:-$(next_version "${CURRENT_MAIN_VERSION}")}"
   AGENT_VERSION="${AGENT_VERSION:-$(next_version "${CURRENT_AGENT_VERSION}")}"
 fi
+
+validate_release_version() {
+  local label="$1"
+  local version="$2"
+  if [[ ! "${version}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "ERROR: ${label} must be an exact semantic version such as v1.2.3; got '${version}'" >&2
+    exit 1
+  fi
+}
+validate_release_version "MAIN_VERSION" "${MAIN_VERSION}"
+validate_release_version "AGENT_VERSION" "${AGENT_VERSION}"
+
 MAIN_VERSION_LDFLAGS="${MAIN_VERSION#v}"
 AGENT_VERSION_LDFLAGS="${AGENT_VERSION#v}"
+
+# PUBLIC_AGENT_TAG 是 agent 那条版本线在**公开镜像仓库**里的 tag，带 agent- 前缀。
+#
+# 公开镜像同时承载主控和 agent 两条独立递增的版本线。此前两条线都用裸 v<x.y.z>
+# 打 tag，而它们各自 patch+1、间隔恒定，所以 agent 迟早会撞上若干次之前主控用过的
+# tag（当前 main v0.1.36 / agent v0.1.12，间隔 24 → 第 25 次发版必撞）。撞上时
+# release 已存在 → 发布中止，而两个私有仓库那时已经发出去了。
+# 加前缀让两条线各自占用互不相交的 tag 命名空间，冲突在结构上不再可能发生。
+# 私有仓库仍用裸 v<x.y.z>（那里只有一条线），latest_remote_tag_version 也只读私有
+# 仓库的 v* tag，不受影响。agent 侧的对应实现见 update/update.go 的 agentMirrorTag。
+# review-2026-07-27 H-2
+PUBLIC_AGENT_TAG="agent-${AGENT_VERSION}"
 MAIN_GIT_HASH="${MAIN_GIT_HASH:-$(git -C "${MAIN_DIR}" rev-parse --short HEAD)}"
 PUBLISH_RELEASES="${PUBLISH_RELEASES:-1}"
 ALLOW_RELEASE_CLOBBER="${ALLOW_RELEASE_CLOBBER:-0}"
-
-prepare_release_signing_key
 
 validate_git_cleanliness() {
   local repo_dir="$1"
@@ -403,6 +490,55 @@ AGENT_TARGETS=(
 
 validate_git_cleanliness "${MAIN_DIR}" "wait-main"
 validate_git_cleanliness "${AGENT_DIR}" "wait-agent-main"
+validate_git_cleanliness "${WEB_DIR}" "wait-web-next"
+
+# 完整 commit：用作 gh release create 的 --target，保证 tag 落在真正编译的那个 commit 上。
+# 必须放在 validate_git_cleanliness 之后 —— 那一步才确认了目录确实是个 git 仓库。
+# review-2026-07-26 P1-14 / 复审
+MAIN_COMMIT="$(git -C "${MAIN_DIR}" rev-parse HEAD)"
+AGENT_COMMIT="$(git -C "${AGENT_DIR}" rev-parse HEAD)"
+WEB_COMMIT="$(git -C "${WEB_DIR}" rev-parse HEAD)"
+
+# --target 指向的 commit 必须已经推到远端，否则 GitHub 建不出 tag。
+#
+# 两个私有仓库的 release 带 --target 且**最先发布**：如果 wait-main 的 commit 没推
+# 而 wait-agent-main 的推了，主控 release 直接失败、后面三个一个都发不出去；反过来
+# 若 agent 的 commit 没推，主控 release 已经发出去了，剩下三个全挂 —— 半个版本。
+# 公开镜像那两个不带 --target，不受这条限制。宁可在开始发布前就拦下来。
+# review-2026-07-26 复审 / review-2026-07-27 修正注释里说反的发布顺序
+validate_commit_pushed() {
+  local repo_dir="$1"
+  local label="$2"
+  local commit="$3"
+  # PUBLISH_RELEASES=0 是文档里明确支持的 dry-run：只构建、不发布，自然也就不需要
+  # commit 已经推到远端。与 validate_git_cleanliness 的处理保持一致。
+  # review-2026-07-27 low
+  if [ "${PUBLISH_RELEASES}" != "1" ]; then
+    return
+  fi
+  if [ "${SKIP_REMOTE_COMMIT_CHECK:-0}" = "1" ]; then
+    return
+  fi
+  # 快路径：刚推上去的 commit 通常就是某个远端分支的 tip，直接用 ls-remote 问远端
+  # 真实 refs 命中即可。不能用 git branch -r --contains 做这一步 —— 它看的是本地
+  # remote-tracking 引用，push 之后没 fetch，本地引用还停留在旧位置，会把刚推上去的
+  # commit 误判成"不在任何远端分支"。review-2026-07-27
+  if git -C "${repo_dir}" ls-remote --heads origin 2>/dev/null \
+    | awk -v c="${commit}" '$1 == c { found = 1 } END { exit !found }'; then
+    return
+  fi
+  # 不是任何远端分支的 tip（例如推送后远端又前进了）：fetch 一次刷新 remote-tracking
+  # 引用，再用本地对象做祖先关系判断。
+  git -C "${repo_dir}" fetch --quiet origin
+  if [ -z "$(git -C "${repo_dir}" branch -r --contains "${commit}" 2>/dev/null)" ]; then
+    echo "ERROR: ${label} HEAD (${commit}) is not present on any remote branch." >&2
+    echo "       Push it first, otherwise 'gh release create --target ${commit}' cannot create the tag." >&2
+    exit 1
+  fi
+}
+validate_commit_pushed "${MAIN_DIR}" "wait-main" "${MAIN_COMMIT}"
+validate_commit_pushed "${AGENT_DIR}" "wait-agent-main" "${AGENT_COMMIT}"
+validate_commit_pushed "${WEB_DIR}" "wait-web-next" "${WEB_COMMIT}"
 
 mkdir -p "${OUT_DIR}" "${STAGING_ROOT}"
 rm -rf "${MAIN_BUILD_DIR}" "${AGENT_BUILD_DIR}" "${WEB_BUILD_DIR}" "${OUT_DIR}/.staging"
@@ -432,13 +568,25 @@ else
 fi
 
 printf '\n==> [1/6] Build web dist\n'
-npm ci --prefix "${WEB_DIR}"
-if [ "${SKIP_QUALITY_GATE:-0}" != "1" ]; then
-  printf '  wait-web-next: lint + unit tests\n'
-  npm run lint --prefix "${WEB_DIR}"
-  npm run test:unit --prefix "${WEB_DIR}"
+if [ "${SKIP_WEB_BUILD:-0}" = "1" ]; then
+  printf '  wait-web-next: using prebuilt dist (SKIP_WEB_BUILD=1)\n'
+  if [ ! -f "${WEB_DIR}/dist/index.html" ]; then
+    echo "ERROR: SKIP_WEB_BUILD=1 but ${WEB_DIR}/dist/index.html is missing" >&2
+    exit 1
+  fi
+else
+  npm ci --prefix "${WEB_DIR}"
+  if [ "${SKIP_QUALITY_GATE:-0}" != "1" ]; then
+    printf '  wait-web-next: lint + unit tests\n'
+    npm run lint --prefix "${WEB_DIR}"
+    npm run test:unit --prefix "${WEB_DIR}"
+  fi
+  npm run build --prefix "${WEB_DIR}"
 fi
-npm run build --prefix "${WEB_DIR}"
+
+# Frontend build hooks have finished before any dry-run key is generated or a configured
+# release key is validated/read. CI additionally builds the frontend in a credential-free step.
+prepare_release_signing_key
 
 printf '\n==> [2/6] Build wait-main in staging workspace\n'
 rm -rf "${MAIN_STAGING_DIR}"
@@ -526,7 +674,10 @@ Artifacts:
 Release publish targets:
 - canonical wait-monitor release tags and source of truth: ${MAIN_PRIVATE_REPO} (${MAIN_VERSION})
 - canonical wait-agent release tags and source of truth: ${AGENT_PRIVATE_REPO} (${AGENT_VERSION})
-- public installer + mirrored download channel: ${PUBLIC_RELEASE_REPO} (${MAIN_VERSION})
+- public installer + mirrored download channel: ${PUBLIC_RELEASE_REPO} (${MAIN_VERSION}, stays 'latest')
+- agent self-update channel: ${PUBLIC_RELEASE_REPO} (${PUBLIC_AGENT_TAG}); agents read
+  wait-agent-version.txt (${AGENT_VERSION}) from the latest mirror release and then pin
+  the agent-prefixed tag, which cannot collide with any main-line tag in this mirror
 - installer overrides:
   - WAIT_MAIN_RELEASE_REPO_URL
   - WAIT_MAIN_RELEASE_VERSION
@@ -534,12 +685,27 @@ Release publish targets:
   - WAIT_RELEASE_SIGNING_KEY
 EOF
 
+# agent 版本指针（review-2026-07-26 P0-6）
+#
+# 公开镜像仓库里同时躺着两条独立的版本线：主控的 v<MAIN> 和 agent 的 v<AGENT>。
+# agent 版本指针：公开镜像里有主控和 agent 两条独立的版本线，"取仓库里最新的
+# release"这种判断会让 agent 拿主控的版本号跟自己比——既可能误判"已是最新"，也可能
+# 把自身版本跳到主控版本线上。这个指针文件随 latest（主控 tag）发布，让 agent 先确定
+# 属于自己那条线的版本，再拼出 agent-<version> 精确取该 release
+# （见 update/update.go 的 defaultFetchAgentVersionPointer / agentMirrorTag）。
+# 它必须在 SHA256SUMS 计算之前写好，才能被校验覆盖。
+printf '%s\n' "${AGENT_VERSION}" > "${OUT_DIR}/wait-agent-version.txt"
+
 CHECKSUM_INPUTS=()
 rm -f "${OUT_DIR}/SHA256SUMS.txt" "${OUT_DIR}/SHA256SUMS.txt.sig" "${OUT_DIR}/${RELEASE_SIGNING_PUBKEY_ASSET}"
 write_release_public_key "${OUT_DIR}/${RELEASE_SIGNING_PUBKEY_ASSET}"
 while IFS= read -r file_path; do
   CHECKSUM_INPUTS+=("${file_path}")
 done < <(find "${OUT_DIR}" -path "${OUT_DIR}/.staging" -prune -o -type f ! -name 'SHA256SUMS.txt' ! -name '*.sig' -print | LC_ALL=C sort)
+if [ "${#CHECKSUM_INPUTS[@]}" -eq 0 ]; then
+  echo "ERROR: no release artifacts found under ${OUT_DIR}; refusing to write an empty SHA256SUMS.txt." >&2
+  exit 1
+fi
 write_sha256sums "${OUT_DIR}/SHA256SUMS.txt" "${CHECKSUM_INPUTS[@]}"
 
 SIGNATURE_TARGETS=(
@@ -653,9 +819,39 @@ PUBLIC_ASSETS=(
   "${OUT_DIR}/SBOM.wait-main.go-modules.txt#SBOM.wait-main.go-modules.txt"
   "${OUT_DIR}/SBOM.wait-agent.go-modules.txt#SBOM.wait-agent.go-modules.txt"
   "${OUT_DIR}/SBOM.wait-web-next.npm.json#SBOM.wait-web-next.npm.json"
+  "${OUT_DIR}/wait-agent-version.txt#wait-agent-version.txt"
 )
 append_asset_if_exists PUBLIC_ASSETS "${OUT_DIR}/NOTICE.wait-main" "NOTICE.wait-main"
 append_asset_if_exists PUBLIC_ASSETS "${OUT_DIR}/NOTICE.wait-agent" "NOTICE.wait-agent"
+
+# agent 自更新专用的镜像 release（review-2026-07-26 P0-6 / review-2026-07-27 H-2）
+#
+# 与上面那个主控 tag 的镜像 release 分开：agent 读到版本指针后按 PUBLIC_AGENT_TAG
+# （即 agent-${AGENT_VERSION}）精确取这个 release，只需要 agent 二进制与配套的校验材料。
+# 主控 tag 的 release 仍然保持 latest（两个安装脚本都靠 latest/download 取资产），
+# 所以这里**不**从 PUBLIC_ASSETS 里移除 agent 资产。
+PUBLIC_AGENT_ASSETS=(
+  "${AGENT_BUILD_DIR}/wait-agent-linux-amd64#wait-agent-linux-amd64"
+  "${AGENT_BUILD_DIR}/wait-agent-linux-amd64.sig#wait-agent-linux-amd64.sig"
+  "${AGENT_BUILD_DIR}/wait-agent-linux-amd64.sha256#wait-agent-linux-amd64.sha256"
+  "${AGENT_BUILD_DIR}/wait-agent-linux-arm64#wait-agent-linux-arm64"
+  "${AGENT_BUILD_DIR}/wait-agent-linux-arm64.sig#wait-agent-linux-arm64.sig"
+  "${AGENT_BUILD_DIR}/wait-agent-linux-arm64.sha256#wait-agent-linux-arm64.sha256"
+  "${AGENT_BUILD_DIR}/wait-agent-windows-amd64.exe#wait-agent-windows-amd64.exe"
+  "${AGENT_BUILD_DIR}/wait-agent-windows-amd64.exe.sig#wait-agent-windows-amd64.exe.sig"
+  "${AGENT_BUILD_DIR}/wait-agent-windows-amd64.exe.sha256#wait-agent-windows-amd64.exe.sha256"
+  "${AGENT_BUILD_DIR}/wait-agent-windows-arm64.exe#wait-agent-windows-arm64.exe"
+  "${AGENT_BUILD_DIR}/wait-agent-windows-arm64.exe.sig#wait-agent-windows-arm64.exe.sig"
+  "${AGENT_BUILD_DIR}/wait-agent-windows-arm64.exe.sha256#wait-agent-windows-arm64.exe.sha256"
+  "${OUT_DIR}/LICENSE.wait-agent#LICENSE.wait-agent"
+  "${OUT_DIR}/SHA256SUMS.txt#SHA256SUMS.txt"
+  "${OUT_DIR}/SHA256SUMS.txt.sig#SHA256SUMS.txt.sig"
+  "${OUT_DIR}/${RELEASE_SIGNING_PUBKEY_ASSET}#${RELEASE_SIGNING_PUBKEY_ASSET}"
+  "${OUT_DIR}/PROVENANCE.json#PROVENANCE.json"
+  "${OUT_DIR}/SBOM.wait-agent.go-modules.txt#SBOM.wait-agent.go-modules.txt"
+  "${OUT_DIR}/wait-agent-version.txt#wait-agent-version.txt"
+)
+append_asset_if_exists PUBLIC_AGENT_ASSETS "${OUT_DIR}/NOTICE.wait-agent" "NOTICE.wait-agent"
 
 MAIN_NOTES="$(cat <<EOF
 ## Summary
@@ -684,11 +880,40 @@ PUBLIC_NOTES="$(cat <<EOF
 EOF
 )"
 
-upload_release_assets "${MAIN_PRIVATE_REPO}" "${MAIN_VERSION}" "${MAIN_NOTES}" "${MAIN_ASSETS[@]}"
-upload_release_assets "${AGENT_PRIVATE_REPO}" "${AGENT_VERSION}" "${AGENT_NOTES}" "${AGENT_ASSETS[@]}"
-upload_release_assets "${PUBLIC_RELEASE_REPO}" "${MAIN_VERSION}" "${PUBLIC_NOTES}" "${PUBLIC_ASSETS[@]}"
+PUBLIC_AGENT_NOTES="$(cat <<EOF
+## Summary
+- wait-agent ${AGENT_VERSION}: Linux/Windows binaries (x86 + ARM)
+- This release exists so deployed agents can resolve their own version line: the agent
+  reads wait-agent-version.txt (${AGENT_VERSION}) from the latest mirror release and then
+  pins the agent-prefixed tag ${PUBLIC_AGENT_TAG}.
+- The agent- prefix keeps the two version lines in separate tag namespaces, so an agent
+  version can never collide with a main version published earlier in this mirror.
+- Installer downloads keep using the main-tagged mirror release (${MAIN_VERSION}), which stays latest.
+- Canonical agent tags remain in ${AGENT_PRIVATE_REPO} (unprefixed, one line only)
+EOF
+)"
+
+# 先把 4 个目标槽位全查一遍，任何一个已存在就在发布**之前**中止。
+# 顺序与下面的实际发布顺序一致，报错信息指向第一个撞车的槽位。
+assert_release_absent "${MAIN_PRIVATE_REPO}" "${MAIN_VERSION}"
+assert_release_absent "${AGENT_PRIVATE_REPO}" "${AGENT_VERSION}"
+assert_release_absent "${PUBLIC_RELEASE_REPO}" "${PUBLIC_AGENT_TAG}"
+assert_release_absent "${PUBLIC_RELEASE_REPO}" "${MAIN_VERSION}"
+
+upload_release_assets "${MAIN_PRIVATE_REPO}" "${MAIN_VERSION}" "${MAIN_NOTES}" "${MAIN_COMMIT}" "" "${MAIN_ASSETS[@]}"
+upload_release_assets "${AGENT_PRIVATE_REPO}" "${AGENT_VERSION}" "${AGENT_NOTES}" "${AGENT_COMMIT}" "" "${AGENT_ASSETS[@]}"
+
+# 发布顺序有意义（review-2026-07-26 P0-6）：
+# agent tag 的镜像 release 必须先发，主控 tag 的镜像 release 后发，这样 GitHub 的
+# /releases/latest 仍然指向主控 tag —— install-wait.sh 与 install-agent.sh 都靠
+# latest/download 取资产，主控 tag 的 release 里两边的资产俱全。
+# agent 镜像 tag 带 agent- 前缀（PUBLIC_AGENT_TAG），与主控 tag 不共享命名空间，
+# 因此无论两条版本线是否相等都照常发布，不再需要"相等就跳过"的特例。
+upload_release_assets "${PUBLIC_RELEASE_REPO}" "${PUBLIC_AGENT_TAG}" "${PUBLIC_AGENT_NOTES}" "" false "${PUBLIC_AGENT_ASSETS[@]}"
+upload_release_assets "${PUBLIC_RELEASE_REPO}" "${MAIN_VERSION}" "${PUBLIC_NOTES}" "" true "${PUBLIC_ASSETS[@]}"
 
 printf '\nPublished releases:\n'
 printf '  - %s %s\n' "${MAIN_PRIVATE_REPO}" "${MAIN_VERSION}"
 printf '  - %s %s\n' "${AGENT_PRIVATE_REPO}" "${AGENT_VERSION}"
+printf '  - %s %s\n' "${PUBLIC_RELEASE_REPO}" "${PUBLIC_AGENT_TAG}"
 printf '  - %s %s\n' "${PUBLIC_RELEASE_REPO}" "${MAIN_VERSION}"

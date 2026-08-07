@@ -291,11 +291,12 @@ select_runtime_identity() {
         return
     fi
 
-    if [ "$port" -lt 1024 ] && ! command -v setcap >/dev/null 2>&1; then
-        warn "监听端口低于 1024 且未检测到 setcap，将继续以 root 运行"
-        return
-    fi
-
+    # review-2026-07-27 low：这里原来在低端口且没有 setcap 时退回 root 运行。
+    #
+    # 那道检查是 P0-7 之前的遗留：当时靠给二进制打 setcap 来绑定低端口。现在低端口
+    # 走的是 systemd unit 里的 AmbientCapabilities=CAP_NET_BIND_SERVICE（见
+    # needs_net_bind_capability），跟本机有没有 setcap 这个命令完全无关 —— 而最小化
+    # 镜像通常不带 libcap 工具，于是这些机器白白继续以 root 跑，拿不到 P0-7 的收益。
     RUNTIME_USER="$SERVICE_USER"
     RUNTIME_GROUP="$SERVICE_GROUP"
 }
@@ -335,21 +336,54 @@ current_service_port() {
         echo "$DEFAULT_PORT"
         return
     fi
-    sed -n 's/^ExecStart=.*0\.0\.0\.0:\([0-9][0-9]*\).*$/\1/p' "$service_file" | head -n 1
+    awk '
+        /^ExecStart=/ {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "-l" && (i + 1) <= NF) {
+                    address = $(i + 1)
+                    sub(/^.*:/, "", address)
+                    if (address ~ /^[0-9]+$/) print address
+                }
+            }
+        }
+    ' "$service_file" | head -n 1
 }
 
+current_service_working_directory() {
+    local service_file
+    service_file="$(current_service_file)"
+    if [ ! -f "$service_file" ]; then
+        echo "$DATA_DIR"
+        return
+    fi
+    sed -n 's/^WorkingDirectory=//p' "$service_file" | head -n 1
+}
+
+# 低端口绑定用 systemd 的 ambient capability，而不是二进制上的文件 capability。
+#
+# review-2026-07-26 P0-7：原实现给二进制打 setcap cap_net_bind_service=+ep，同时
+# 在 unit 里写 NoNewPrivileges=true。Linux 在 no_new_privs 下 execve 会**忽略文件
+# capabilities**，进程拿到的是空能力集 —— 于是监听 80/443 直接 EACCES，安装脚本在
+# 二进制和 unit 都已落盘之后才报"服务启动失败"。AmbientCapabilities 不受
+# no_new_privs 影响，是这个组合下唯一可行的授权方式。
 configure_binary_runtime_privileges() {
-    local port="$1"
+    # 清掉历史版本可能留下的文件 capability：现在改由 systemd 授予，留着只会造成困惑。
     if command -v setcap >/dev/null 2>&1; then
         setcap -r "$BINARY_PATH" 2>/dev/null || true
     fi
+}
 
-    if [ "$RUNTIME_USER" != "root" ] && [ "$port" -lt 1024 ]; then
-        if ! command -v setcap >/dev/null 2>&1; then
-            err "端口低于 1024 时需要 setcap 支持非 root 绑定"
-            return 1
-        fi
-        setcap cap_net_bind_service=+ep "$BINARY_PATH"
+# needs_net_bind_capability 判断该配置是否需要 CAP_NET_BIND_SERVICE。
+needs_net_bind_capability() {
+    local port="$1"
+    [ "$RUNTIME_USER" != "root" ] && [ "$port" -lt 1024 ]
+}
+
+# render_ambient_caps_directives 生成 unit 里的能力相关指令（不需要时输出空串）。
+render_ambient_caps_directives() {
+    local port="$1"
+    if needs_net_bind_capability "$port"; then
+        printf 'AmbientCapabilities=CAP_NET_BIND_SERVICE\nCapabilityBoundingSet=CAP_NET_BIND_SERVICE\n'
     fi
 }
 
@@ -390,26 +424,26 @@ is_installed() {
 
 # ── Dependencies ───────────────────────────────────────────
 install_dependencies() {
-    if command -v curl >/dev/null 2>&1; then
+    if command -v curl >/dev/null 2>&1 && command -v openssl >/dev/null 2>&1; then
         return
     fi
 
-    step "安装 curl 依赖..."
+    step "安装 curl 与 openssl 依赖..."
     if command -v apt >/dev/null 2>&1; then
-        apt update -qq && apt install -y curl >/dev/null 2>&1
+        apt update -qq && apt install -y curl openssl ca-certificates >/dev/null 2>&1
     elif command -v yum >/dev/null 2>&1; then
-        yum install -y curl >/dev/null 2>&1
+        yum install -y curl openssl ca-certificates >/dev/null 2>&1
     elif command -v apk >/dev/null 2>&1; then
-        apk add curl >/dev/null 2>&1
+        apk add curl openssl ca-certificates >/dev/null 2>&1
     else
         err "未找到支持的包管理器 (apt/yum/apk)"
         exit 1
     fi
 
-    if command -v curl >/dev/null 2>&1; then
-        ok "curl 安装成功"
+    if command -v curl >/dev/null 2>&1 && command -v openssl >/dev/null 2>&1; then
+        ok "curl 与 openssl 安装成功"
     else
-        err "curl 安装失败"
+        err "curl 或 openssl 安装失败"
         exit 1
     fi
 }
@@ -551,9 +585,23 @@ install_binary() {
 }
 
 # ── systemd service ────────────────────────────────────────
+# ProtectSystem=strict（原为 full）让状态目录之外的整个文件系统只读；
+# full 只覆盖 /usr、/boot、/etc，/opt、/var、/srv 都还是可写的。
+#
+# ReadWritePaths 放的是整个状态目录而不只是 data/：还原流程会在 WorkingDirectory
+# 下直接 rename ./data -> ./data.old.tmp 并写 ./backup/（dbcore.go 里的原子交换），
+# 只放开 data/ 会让还原在最后一步失败。
+# review-2026-07-26 P1-10
 create_systemd_service() {
     local port="$1"
     local service_file="/etc/systemd/system/${SERVICE_NAME}.service"
+    # 低端口需要的能力由 systemd 授予（见 render_ambient_caps_directives 的注释）。
+    local AMBIENT_CAPS_DIRECTIVES
+    # $( ) 会吃掉结尾换行，而这里的结尾换行是有意义的（它把最后一条指令和
+    # 下一行的 PrivateTmp= 分开）。补一个哨兵字符再去掉，保住换行。
+    AMBIENT_CAPS_DIRECTIVES="$(render_ambient_caps_directives "$port"; printf x)"
+    AMBIENT_CAPS_DIRECTIVES="${AMBIENT_CAPS_DIRECTIVES%x}"
+    rm -f "$(systemd_security_dropin_path 2>/dev/null || true)"
     cat > "$service_file" << EOF
 [Unit]
 Description=Wait Monitor Service
@@ -569,20 +617,48 @@ User=${RUNTIME_USER}
 Group=${RUNTIME_GROUP}
 UMask=0077
 NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
+${AMBIENT_CAPS_DIRECTIVES}PrivateTmp=true
+ProtectSystem=strict
 ProtectHome=true
 ProtectControlGroups=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 RestrictSUIDSGID=true
 LockPersonality=true
-ReadWritePaths=${SERVICE_DATA_DIR}
+ReadWritePaths=${DATA_DIR}
 
 [Install]
 WantedBy=multi-user.target
 EOF
     ok "systemd 服务文件已创建"
+}
+
+systemd_security_dropin_path() {
+    echo "/etc/systemd/system/${SERVICE_NAME}.service.d/20-wait-security.conf"
+}
+
+create_systemd_security_dropin() {
+    local port="$1"
+    local writable_path="$2"
+    local dropin_path
+    local AMBIENT_CAPS_DIRECTIVES
+    dropin_path="$(systemd_security_dropin_path)"
+    AMBIENT_CAPS_DIRECTIVES="$(render_ambient_caps_directives "$port"; printf x)"
+    AMBIENT_CAPS_DIRECTIVES="${AMBIENT_CAPS_DIRECTIVES%x}"
+    mkdir -p "$(dirname "$dropin_path")"
+    cat > "$dropin_path" << EOF
+[Service]
+NoNewPrivileges=true
+${AMBIENT_CAPS_DIRECTIVES}PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=${writable_path}
+EOF
 }
 
 # ── Access info ────────────────────────────────────────────
@@ -687,11 +763,16 @@ upgrade_wait() {
         return 1
     }
     local current_port
+    local current_working_directory
     local configured_user
     current_port="$(current_service_port)"
+    current_working_directory="$(current_service_working_directory)"
     configured_user="$(current_service_user)"
     if [ -z "$current_port" ]; then
         current_port="$DEFAULT_PORT"
+    fi
+    if [ -z "$current_working_directory" ]; then
+        current_working_directory="$DATA_DIR"
     fi
     if [ -n "$configured_user" ] && [ "$configured_user" != "root" ]; then
         ensure_service_account || warn "未能确认专用服务账号存在，将保留当前服务文件配置"
@@ -740,13 +821,21 @@ upgrade_wait() {
     install -m 755 "$TMP_DOWNLOAD_PATH" "$BINARY_PATH"
     rm -f "$TMP_DOWNLOAD_PATH"
     TMP_DOWNLOAD_PATH=""
-    if ! configure_binary_runtime_privileges "$current_port"; then
-        err "应用运行权限失败，恢复备份并终止"
-        restore_backup_verified "$backup_path" "$BINARY_PATH" "$backup_hash" || err "恢复备份校验失败，请手动检查 ${backup_path}"
-        configure_binary_runtime_privileges "$current_port" || true
-        systemctl start ${SERVICE_NAME}.service
-        return 1
+    # configure_binary_runtime_privileges 现在只做幂等的 setcap -r 清理，不会失败，
+    # 原来的失败回滚分支已删除（review-2026-07-27 清理）。
+    configure_binary_runtime_privileges "$current_port"
+
+    # 保留管理员维护的主 unit（bind 地址、Group、Environment、ExecStart flags 等），
+    # 仅用 drop-in 增加本项目负责的安全项。失败回滚时 drop-in 也必须恢复。
+    local security_dropin
+    local security_dropin_backup=""
+    security_dropin="$(systemd_security_dropin_path)"
+    if [ -f "$security_dropin" ]; then
+        security_dropin_backup="${security_dropin}.upgrade-backup"
+        cp -p "$security_dropin" "$security_dropin_backup"
     fi
+    create_systemd_security_dropin "$current_port" "$current_working_directory"
+    systemctl daemon-reload
 
     systemctl start ${SERVICE_NAME}.service
     if systemctl is-active --quiet ${SERVICE_NAME}.service; then
@@ -756,9 +845,18 @@ upgrade_wait() {
         err "服务升级后未能启动"
         warn "正在回滚到备份版本..."
         restore_backup_verified "$backup_path" "$BINARY_PATH" "$backup_hash" || err "恢复备份校验失败，请手动检查 ${backup_path}"
+        if [ -n "$security_dropin_backup" ] && [ -f "$security_dropin_backup" ]; then
+            mv -f "$security_dropin_backup" "$security_dropin"
+        else
+            rm -f "$security_dropin"
+        fi
+        systemctl daemon-reload
         configure_binary_runtime_privileges "$current_port" || true
         systemctl start ${SERVICE_NAME}.service || true
         return 1
+    fi
+    if [ -n "$security_dropin_backup" ]; then
+        rm -f "$security_dropin_backup"
     fi
 }
 
@@ -785,6 +883,8 @@ uninstall_wait() {
         systemctl stop ${SERVICE_NAME}.service >/dev/null 2>&1
         systemctl disable ${SERVICE_NAME}.service >/dev/null 2>&1
         rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
+        rm -f "$(systemd_security_dropin_path)"
+        rmdir "/etc/systemd/system/${SERVICE_NAME}.service.d" 2>/dev/null || true
         systemctl daemon-reload
         ok "systemd 服务已移除"
     fi
