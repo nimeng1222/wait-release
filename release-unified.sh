@@ -403,20 +403,40 @@ resolve_current_version() {
 CURRENT_MAIN_VERSION="${CURRENT_MAIN_VERSION:-$(resolve_current_version "Main Version" "${MAIN_DIR}")}"
 CURRENT_AGENT_VERSION="${CURRENT_AGENT_VERSION:-$(resolve_current_version "Agent Version" "${AGENT_DIR}")}"
 
-next_version() {
-  local version="$1"
-  IFS='.' read -r major minor patch <<< "$version"
-  printf 'v%s.%s.%s' "$major" "$minor" "$((patch + 1))"
+REUSE_RELEASE_VERSIONS="${REUSE_RELEASE_VERSIONS:-0}"
+MAIN_COMMIT="${MAIN_COMMIT:-$(git -C "${MAIN_DIR}" rev-parse HEAD)}"
+AGENT_COMMIT="${AGENT_COMMIT:-$(git -C "${AGENT_DIR}" rev-parse HEAD)}"
+WEB_COMMIT="${WEB_COMMIT:-$(git -C "${WEB_DIR}" rev-parse HEAD)}"
+
+resolve_remote_tag_commit() {
+  local repo_dir="$1"
+  local tag="$2"
+  local refs
+  refs="$(git -C "${repo_dir}" ls-remote origin "refs/tags/${tag}" "refs/tags/${tag}^{}" 2>/dev/null || true)"
+  printf '%s\n' "${refs}" | awk '
+    /\^\{\}$/ { peeled = $1 }
+    !/\^\{\}$/ { direct = $1 }
+    END { if (peeled != "") print peeled; else print direct }
+  '
 }
 
-REUSE_RELEASE_VERSIONS="${REUSE_RELEASE_VERSIONS:-0}"
-if [ "${REUSE_RELEASE_VERSIONS}" = "1" ]; then
-  MAIN_VERSION="${MAIN_VERSION:-v${CURRENT_MAIN_VERSION}}"
-  AGENT_VERSION="${AGENT_VERSION:-v${CURRENT_AGENT_VERSION}}"
-else
-  MAIN_VERSION="${MAIN_VERSION:-$(next_version "${CURRENT_MAIN_VERSION}")}"
-  AGENT_VERSION="${AGENT_VERSION:-$(next_version "${CURRENT_AGENT_VERSION}")}"
+CURRENT_AGENT_COMMIT="${CURRENT_AGENT_COMMIT:-$(resolve_remote_tag_commit "${AGENT_DIR}" "v${CURRENT_AGENT_VERSION}")}"
+VERSION_PLAN_LIB="${SCRIPT_DIR}/release-version-plan.sh"
+if [ ! -f "${VERSION_PLAN_LIB}" ]; then
+  echo "ERROR: release version planner not found: ${VERSION_PLAN_LIB}" >&2
+  exit 1
 fi
+# shellcheck source=release-version-plan.sh
+source "${VERSION_PLAN_LIB}"
+resolve_release_version_plan \
+  "${CURRENT_MAIN_VERSION}" \
+  "${CURRENT_AGENT_VERSION}" \
+  "${AGENT_COMMIT}" \
+  "${CURRENT_AGENT_COMMIT}" \
+  "${REUSE_RELEASE_VERSIONS}" \
+  "${MAIN_VERSION:-}" \
+  "${AGENT_VERSION:-}" \
+  "${FORCE_AGENT_RELEASE:-0}"
 
 validate_release_version() {
   local label="$1"
@@ -446,6 +466,21 @@ PUBLIC_AGENT_TAG="agent-${AGENT_VERSION}"
 MAIN_GIT_HASH="${MAIN_GIT_HASH:-$(git -C "${MAIN_DIR}" rev-parse --short HEAD)}"
 PUBLISH_RELEASES="${PUBLISH_RELEASES:-1}"
 ALLOW_RELEASE_CLOBBER="${ALLOW_RELEASE_CLOBBER:-0}"
+
+if [ "${REUSE_RELEASE_VERSIONS}" = "1" ] && [ "${ALLOW_RELEASE_CLOBBER}" != "1" ]; then
+  echo "ERROR: REUSE_RELEASE_VERSIONS=1 requires ALLOW_RELEASE_CLOBBER=1 because existing releases will be replaced." >&2
+  exit 1
+fi
+if [ "${PUBLISH_RELEASES}" = "1" ] && [ "${ALLOW_RELEASE_CLOBBER}" != "1" ]; then
+  if [ "${MAIN_VERSION}" = "v${CURRENT_MAIN_VERSION}" ]; then
+    echo "ERROR: publishing the current main version requires ALLOW_RELEASE_CLOBBER=1." >&2
+    exit 1
+  fi
+  if [ "${AGENT_RELEASE_REQUIRED}" = "1" ] && [ "${AGENT_VERSION}" = "v${CURRENT_AGENT_VERSION}" ]; then
+    echo "ERROR: republishing the current agent version requires ALLOW_RELEASE_CLOBBER=1." >&2
+    exit 1
+  fi
+fi
 
 validate_git_cleanliness() {
   local repo_dir="$1"
@@ -491,13 +526,6 @@ AGENT_TARGETS=(
 validate_git_cleanliness "${MAIN_DIR}" "wait-main"
 validate_git_cleanliness "${AGENT_DIR}" "wait-agent-main"
 validate_git_cleanliness "${WEB_DIR}" "wait-web-next"
-
-# 完整 commit：用作 gh release create 的 --target，保证 tag 落在真正编译的那个 commit 上。
-# 必须放在 validate_git_cleanliness 之后 —— 那一步才确认了目录确实是个 git 仓库。
-# review-2026-07-26 P1-14 / 复审
-MAIN_COMMIT="$(git -C "${MAIN_DIR}" rev-parse HEAD)"
-AGENT_COMMIT="$(git -C "${AGENT_DIR}" rev-parse HEAD)"
-WEB_COMMIT="$(git -C "${WEB_DIR}" rev-parse HEAD)"
 
 # --target 指向的 commit 必须已经推到远端，否则 GitHub 建不出 tag。
 #
@@ -739,7 +767,8 @@ printf '\nRelease output ready: %s\n' "${OUT_DIR}"
 printf 'Main binaries: %s\n' "${MAIN_BUILD_DIR}"
 printf 'Agent binaries: %s\n' "${AGENT_BUILD_DIR}"
 printf 'Web snapshot: %s\n' "${WEB_BUILD_DIR}/dist"
-printf 'Version mode: %s\n' "$( [ "${REUSE_RELEASE_VERSIONS}" = "1" ] && printf 'reuse-current' || printf 'next-patch' )"
+printf 'Version plan: main=%s (%s), agent=%s (%s), publish-agent=%s\n' \
+  "${MAIN_VERSION}" "${MAIN_VERSION_REASON}" "${AGENT_VERSION}" "${AGENT_VERSION_REASON}" "${AGENT_RELEASE_REQUIRED}"
 printf 'Resolved versions: main=%s agent=%s\n' "${MAIN_VERSION}" "${AGENT_VERSION}"
 
 if [ "${PUBLISH_RELEASES}" != "1" ]; then
@@ -896,12 +925,16 @@ EOF
 # 先把 4 个目标槽位全查一遍，任何一个已存在就在发布**之前**中止。
 # 顺序与下面的实际发布顺序一致，报错信息指向第一个撞车的槽位。
 assert_release_absent "${MAIN_PRIVATE_REPO}" "${MAIN_VERSION}"
-assert_release_absent "${AGENT_PRIVATE_REPO}" "${AGENT_VERSION}"
-assert_release_absent "${PUBLIC_RELEASE_REPO}" "${PUBLIC_AGENT_TAG}"
+if [ "${AGENT_RELEASE_REQUIRED}" = "1" ]; then
+  assert_release_absent "${AGENT_PRIVATE_REPO}" "${AGENT_VERSION}"
+  assert_release_absent "${PUBLIC_RELEASE_REPO}" "${PUBLIC_AGENT_TAG}"
+fi
 assert_release_absent "${PUBLIC_RELEASE_REPO}" "${MAIN_VERSION}"
 
 upload_release_assets "${MAIN_PRIVATE_REPO}" "${MAIN_VERSION}" "${MAIN_NOTES}" "${MAIN_COMMIT}" "" "${MAIN_ASSETS[@]}"
-upload_release_assets "${AGENT_PRIVATE_REPO}" "${AGENT_VERSION}" "${AGENT_NOTES}" "${AGENT_COMMIT}" "" "${AGENT_ASSETS[@]}"
+if [ "${AGENT_RELEASE_REQUIRED}" = "1" ]; then
+  upload_release_assets "${AGENT_PRIVATE_REPO}" "${AGENT_VERSION}" "${AGENT_NOTES}" "${AGENT_COMMIT}" "" "${AGENT_ASSETS[@]}"
+fi
 
 # 发布顺序有意义（review-2026-07-26 P0-6）：
 # agent tag 的镜像 release 必须先发，主控 tag 的镜像 release 后发，这样 GitHub 的
@@ -909,11 +942,17 @@ upload_release_assets "${AGENT_PRIVATE_REPO}" "${AGENT_VERSION}" "${AGENT_NOTES}
 # latest/download 取资产，主控 tag 的 release 里两边的资产俱全。
 # agent 镜像 tag 带 agent- 前缀（PUBLIC_AGENT_TAG），与主控 tag 不共享命名空间，
 # 因此无论两条版本线是否相等都照常发布，不再需要"相等就跳过"的特例。
-upload_release_assets "${PUBLIC_RELEASE_REPO}" "${PUBLIC_AGENT_TAG}" "${PUBLIC_AGENT_NOTES}" "" false "${PUBLIC_AGENT_ASSETS[@]}"
+if [ "${AGENT_RELEASE_REQUIRED}" = "1" ]; then
+  upload_release_assets "${PUBLIC_RELEASE_REPO}" "${PUBLIC_AGENT_TAG}" "${PUBLIC_AGENT_NOTES}" "" false "${PUBLIC_AGENT_ASSETS[@]}"
+fi
 upload_release_assets "${PUBLIC_RELEASE_REPO}" "${MAIN_VERSION}" "${PUBLIC_NOTES}" "" true "${PUBLIC_ASSETS[@]}"
 
 printf '\nPublished releases:\n'
 printf '  - %s %s\n' "${MAIN_PRIVATE_REPO}" "${MAIN_VERSION}"
-printf '  - %s %s\n' "${AGENT_PRIVATE_REPO}" "${AGENT_VERSION}"
-printf '  - %s %s\n' "${PUBLIC_RELEASE_REPO}" "${PUBLIC_AGENT_TAG}"
+if [ "${AGENT_RELEASE_REQUIRED}" = "1" ]; then
+  printf '  - %s %s\n' "${AGENT_PRIVATE_REPO}" "${AGENT_VERSION}"
+  printf '  - %s %s\n' "${PUBLIC_RELEASE_REPO}" "${PUBLIC_AGENT_TAG}"
+else
+  printf '  - wait-agent remains at %s (source unchanged)\n' "${AGENT_VERSION}"
+fi
 printf '  - %s %s\n' "${PUBLIC_RELEASE_REPO}" "${MAIN_VERSION}"

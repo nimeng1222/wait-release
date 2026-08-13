@@ -175,6 +175,12 @@ sudo bash install-wait.sh
 
 正式发版建议使用本仓库的 `Unified Release` workflow，不再从个人电脑直接执行发布。
 
+默认版本策略会先显示 release plan：主控包包含后端和内嵌前端，因此每次正式发布提升
+主控补丁版本；Agent 只有在所选源码 commit 与当前 Agent release tag 不同时才提升版本。
+前端或后端单独变化时，Agent 保持原版本且不会重复创建 Agent release。确需重发未变化的
+Agent 时使用 `force_agent_release`。`reuse_release_versions` 会重发主控和 Agent 两条版本线，
+因此必须同时显式开启 `allow_release_clobber`。
+
 ### 必要前置项
 
 1. 前端源码需要在 GitHub 仓库中可 checkout。默认 workflow 使用：
@@ -210,9 +216,10 @@ nimeng1222/wait-release -> Actions -> Unified Release -> Run workflow
 | `agent_ref` | `main` | 要发布的 `wait-agent` ref |
 | `web_ref` | `main` | 要嵌入的前端 ref |
 | `publish_releases` | `true` | 设为 `false` 时只 dry-run 构建并上传 `release-output` artifact；不读取正式签名私钥，而是生成一次性临时密钥供产物自检 |
-| `reuse_release_versions` | `false` | 默认自动 patch +1；设为 `true` 时复用当前版本 |
+| `reuse_release_versions` | `false` | 默认智能规划；设为 `true` 时复用并重发主控与 Agent 当前版本，必须同时开启覆盖 |
 | `allow_release_clobber` | `false` | 默认禁止覆盖已有 release 资产 |
 | `main_version` / `agent_version` | 空 | 显式指定版本时使用，例如 `v0.1.35` |
+| `force_agent_release` | `false` | Agent 源码未变化时仍强制重发 Agent 专属 release |
 
 workflow 会固定使用 Node 22、Go 1.26.5 和已验证签名的 Zig 0.14.1，构建完成后会验签 `SHA256SUMS.txt`、主控二进制和 agent 二进制，并把 `release-output` 作为短期 artifact 留档。
 

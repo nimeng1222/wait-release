@@ -21,7 +21,7 @@ on:
         type: boolean
         default: true
       reuse_release_versions:
-        description: Reuse latest versions instead of bumping patch.
+        description: Reuse all latest versions (requires deliberate clobber when publishing).
         required: true
         type: boolean
         default: false
@@ -38,6 +38,11 @@ on:
         description: Optional explicit agent version, for example v0.1.26
         required: false
         default: ""
+      force_agent_release:
+        description: Publish Agent even when its source commit has not changed.
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -56,6 +61,7 @@ jobs:
       PUBLISH_RELEASES: ${{ inputs.publish_releases && '1' || '0' }}
       REUSE_RELEASE_VERSIONS: ${{ inputs.reuse_release_versions && '1' || '0' }}
       ALLOW_RELEASE_CLOBBER: ${{ inputs.allow_release_clobber && '1' || '0' }}
+      FORCE_AGENT_RELEASE: ${{ inputs.force_agent_release && '1' || '0' }}
 
     steps:
       - name: Validate inputs and checkout secret
@@ -89,6 +95,10 @@ jobs:
           validate_ref WEB_REF "${WEB_REF}"
           validate_version MAIN_VERSION_INPUT "${MAIN_VERSION_INPUT}"
           validate_version AGENT_VERSION_INPUT "${AGENT_VERSION_INPUT}"
+          if [ "${REUSE_RELEASE_VERSIONS}" = "1" ] && [ "${ALLOW_RELEASE_CLOBBER}" != "1" ]; then
+            echo "reuse_release_versions requires allow_release_clobber because existing releases will be replaced" >&2
+            exit 1
+          fi
           if [ -z "${RELEASE_GITHUB_TOKEN}" ]; then
             echo "Missing secret RELEASE_GITHUB_TOKEN" >&2
             exit 1
@@ -171,6 +181,34 @@ jobs:
           if [ -n "${AGENT_VERSION_INPUT}" ]; then
             printf 'AGENT_VERSION=%s\n' "${AGENT_VERSION_INPUT}" >> "${GITHUB_ENV}"
           fi
+
+      - name: Preview release plan
+        env:
+          MAIN_VERSION_INPUT: ${{ inputs.main_version }}
+          AGENT_VERSION_INPUT: ${{ inputs.agent_version }}
+        run: |
+          set -euo pipefail
+          agent_commit="$(git -C wait-agent-main rev-parse HEAD)"
+          current_agent_commit="$(git -C wait-agent-main rev-list -n 1 "v${CURRENT_AGENT_VERSION}")"
+          # shellcheck source=release-version-plan.sh
+          source wait-release/release-version-plan.sh
+          resolve_release_version_plan \
+            "${CURRENT_MAIN_VERSION}" \
+            "${CURRENT_AGENT_VERSION}" \
+            "${agent_commit}" \
+            "${current_agent_commit}" \
+            "${REUSE_RELEASE_VERSIONS}" \
+            "${MAIN_VERSION_INPUT}" \
+            "${AGENT_VERSION_INPUT}" \
+            "${FORCE_AGENT_RELEASE}"
+          {
+            echo "## Release plan"
+            echo ""
+            echo "| Component | Current | Planned | Reason | Publish dedicated release |"
+            echo "| --- | --- | --- | --- | --- |"
+            echo "| wait-main + web | v${CURRENT_MAIN_VERSION} | ${MAIN_VERSION} | ${MAIN_VERSION_REASON} | yes |"
+            echo "| wait-agent | v${CURRENT_AGENT_VERSION} | ${AGENT_VERSION} | ${AGENT_VERSION_REASON} | $([ "${AGENT_RELEASE_REQUIRED}" = "1" ] && echo yes || echo no) |"
+          } | tee -a "${GITHUB_STEP_SUMMARY}"
 
       - name: Set up Go
         uses: actions/setup-go@v6
