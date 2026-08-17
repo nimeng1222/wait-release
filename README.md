@@ -21,7 +21,7 @@ Wait Monitor 是一个轻量级自托管服务器监控系统。本仓库是公�
 支持系统：Linux `amd64` / `arm64`，推荐使用带 systemd 的发行版。
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nimeng1222/wait-release/main/install-wait.sh -o install-wait.sh
+curl -fsSL https://raw.githubusercontent.com/nimeng1222/wait-release/v0.1.72/install-wait.sh -o install-wait.sh
 sudo bash install-wait.sh
 ```
 
@@ -63,7 +63,7 @@ http://<server-ip>:25774
 默认安装最新 release。如果需要固定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nimeng1222/wait-release/main/install-wait.sh -o install-wait.sh
+curl -fsSL https://raw.githubusercontent.com/nimeng1222/wait-release/v0.1.72/install-wait.sh -o install-wait.sh
 sudo WAIT_MAIN_RELEASE_VERSION=v0.1.33 bash install-wait.sh
 ```
 
@@ -86,7 +86,7 @@ Agent 通常不需要手动拼命令。推荐流程：
 Agent 安装脚本需要主控地址和节点 token：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nimeng1222/wait-release/main/install-agent.sh -o install-agent.sh
+curl -fsSL https://raw.githubusercontent.com/nimeng1222/wait-release/v0.1.72/install-agent.sh -o install-agent.sh
 sudo bash install-agent.sh --endpoint "https://example.com" --token "YOUR_NODE_TOKEN"
 ```
 
@@ -158,10 +158,13 @@ sudo bash install-wait.sh
 
 - `wait-linux-amd64`
 - `wait-linux-arm64`
+<!-- BEGIN GENERATED AGENT TARGETS -->
 - `wait-agent-linux-amd64`
 - `wait-agent-linux-arm64`
 - `wait-agent-windows-amd64.exe`
 - `wait-agent-windows-arm64.exe`
+<!-- END GENERATED AGENT TARGETS -->
+- `wait-agent-targets.tsv` / `wait-agent-targets.tsv.sig`
 - `*.sha256`
 - `SHA256SUMS.txt`
 - `MANIFEST.txt`
@@ -169,17 +172,20 @@ sudo bash install-wait.sh
 - `SBOM.*`
 - `LICENSE.*` / `NOTICE.*`
 
-安装脚本会优先下载校验文件并验证二进制完整性。主控安装脚本在校验通过后才会执行二进制兼容性检查。
+Agent 的正式发布平台、文件名、安装器和自更新资格以签名的 `wait-agent-targets.tsv` 为唯一声明；README 中的 Agent 资产块由质量门禁逐项核对。安装脚本会先验签该清单，再选择当前平台资产并验证二进制完整性。主控安装脚本在校验通过后才会执行二进制兼容性检查。
 
 ## GitHub Actions 发版
 
 正式发版建议使用本仓库的 `Unified Release` workflow，不再从个人电脑直接执行发布。
 
-默认版本策略会先显示 release plan：主控包包含后端和内嵌前端，因此每次正式发布提升
+默认版本策略会先生成 release plan：主控包包含后端和内嵌前端，因此每次正式发布提升
 主控补丁版本；Agent 只有在所选源码 commit 与当前 Agent release tag 不同时才提升版本。
-前端或后端单独变化时，Agent 保持原版本且不会重复创建 Agent release。确需重发未变化的
-Agent 时使用 `force_agent_release`。`reuse_release_versions` 会重发主控和 Agent 两条版本线，
-因此必须同时显式开启 `allow_release_clobber`。
+前端或后端单独变化时，Agent 保持原版本且不会重复创建 Agent release。确需为未变化源码
+创建新 Agent 版本时使用 `force_agent_release`。版本必须单调递增，既有 release 资产不可覆盖。
+
+workflow 使用三个隔离 job：无密钥的测试/构建 job 产出不可变 artifact；不 checkout、
+不编译、不执行仓库脚本的签名 job 只对 artifact 摘要和签名；无签名密钥的发布 job 先创建
+draft、逐资产下载复核，再公开整个闭包。任一步失败会删除本次创建的 release/tag，避免半发布。
 
 ### 必要前置项
 
@@ -215,13 +221,11 @@ nimeng1222/wait-release -> Actions -> Unified Release -> Run workflow
 | `main_ref` | `main` | 要发布的 `wait-monitor` ref |
 | `agent_ref` | `main` | 要发布的 `wait-agent` ref |
 | `web_ref` | `main` | 要嵌入的前端 ref |
-| `publish_releases` | `true` | 设为 `false` 时只 dry-run 构建并上传 `release-output` artifact；不读取正式签名私钥，而是生成一次性临时密钥供产物自检 |
-| `reuse_release_versions` | `false` | 默认智能规划；设为 `true` 时复用并重发主控与 Agent 当前版本，必须同时开启覆盖 |
-| `allow_release_clobber` | `false` | 默认禁止覆盖已有 release 资产 |
+| `publish_releases` | `true` | 设为 `false` 时构建、使用隔离 job 的一次性临时密钥签名并上传 artifact，但不创建 Release |
 | `main_version` / `agent_version` | 空 | 显式指定版本时使用，例如 `v0.1.35` |
-| `force_agent_release` | `false` | Agent 源码未变化时仍强制重发 Agent 专属 release |
+| `force_agent_release` | `false` | Agent 源码未变化时仍创建一个单调递增的新 Agent release |
 
-workflow 会固定使用 Node 22、Go 1.26.5 和已验证签名的 Zig 0.14.1，构建完成后会验签 `SHA256SUMS.txt`、主控二进制和 agent 二进制，并把 `release-output` 作为短期 artifact 留档。
+workflow 会固定使用 Node 22、Go 1.26.6 和已验证签名的 Zig 0.14.1；正式发布还要求三个所选源码 commit 都已有成功的 `test` check-run。构建完成后会验证 `SHA256SUMS.txt`、主控/Agent 二进制签名和远端 draft 资产，并把 unsigned/signed artifact 短期留档。
 
 ## 安全说明
 
@@ -237,7 +241,7 @@ Wait Monitor is a lightweight self-hosted server monitoring system. This reposit
 Quick install:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nimeng1222/wait-release/main/install-wait.sh -o install-wait.sh
+curl -fsSL https://raw.githubusercontent.com/nimeng1222/wait-release/v0.1.72/install-wait.sh -o install-wait.sh
 sudo bash install-wait.sh
 ```
 

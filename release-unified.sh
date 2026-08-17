@@ -10,6 +10,11 @@ OUT_DIR="${OUT_DIR:-${ROOT_DIR}/release-output}"
 MAIN_BUILD_DIR="${OUT_DIR}/wait-main"
 AGENT_BUILD_DIR="${OUT_DIR}/wait-agent"
 WEB_BUILD_DIR="${OUT_DIR}/web"
+AGENT_TARGET_MANIFEST="${AGENT_DIR}/update/release-targets.tsv"
+INSTALLER_DIR="${INSTALLER_DIR:-${SCRIPT_DIR}}"
+if [ ! -f "${INSTALLER_DIR}/install-wait.sh" ] || [ ! -f "${INSTALLER_DIR}/install-agent.sh" ]; then
+  INSTALLER_DIR="${ROOT_DIR}/wait-release"
+fi
 STAGING_ROOT="${STAGING_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/wait-release.XXXXXX")}"
 KEEP_STAGING="${KEEP_STAGING:-0}"
 MAIN_STAGING_DIR="${STAGING_ROOT}/wait-main"
@@ -26,6 +31,7 @@ RELEASE_SIGNING_KEY="${WAIT_RELEASE_SIGNING_KEY:-}"
 RELEASE_SIGNING_PUBKEY_ASSET="RELEASE_PUBKEY.pem"
 TEMP_RELEASE_SIGNING_KEY=""
 RELEASE_SIGNING_MODE="configured"
+TARGET_MANIFEST_STAGED=0
 
 sha256_file() {
   local file_path="$1"
@@ -133,20 +139,8 @@ upload_release_assets() {
     return
   fi
 
-  if [ "${ALLOW_RELEASE_CLOBBER}" != "1" ]; then
-    echo "ERROR: release ${tag} already exists in ${repo}. Immutable mode forbids overwriting assets; publish a new version tag." >&2
-    exit 1
-  fi
-
-  echo "Updating existing release ${tag} in ${repo} with ALLOW_RELEASE_CLOBBER=1"
-  gh release upload "${tag}" "${assets[@]+"${assets[@]}"}" --repo "${repo}" --clobber
-  # gh release upload 没有 --latest 标志，而 upload 不改变 release 现有的 latest 状态：
-  # 若 agent 镜像 release 之前已被标成 Latest，clobber 重发不会纠正，latest/download
-  # 仍会指向 agent tag，两个安装脚本随即 404。用 gh release edit 把 latest 状态补正到
-  # 与正常创建路径（上面的 latest_args）一致。review-2026-07-27
-  if [ -n "${latest}" ]; then
-    gh release edit "${tag}" --repo "${repo}" --latest="${latest}"
-  fi
+  echo "ERROR: release ${tag} already exists in ${repo}. Executable release assets are immutable; publish a new version tag." >&2
+  exit 1
 }
 
 # assert_release_absent 在**发布任何东西之前**确认目标 release 槽位是空的。
@@ -157,13 +151,10 @@ upload_release_assets() {
 assert_release_absent() {
   local repo="$1"
   local tag="$2"
-  if [ "${ALLOW_RELEASE_CLOBBER}" = "1" ]; then
-    return
-  fi
   if gh release view "${tag}" --repo "${repo}" >/dev/null 2>&1; then
     echo "ERROR: release ${tag} already exists in ${repo}." >&2
     echo "       Refusing to start publishing, otherwise earlier repos would be left half-published." >&2
-    echo "       Publish a new version tag, or set ALLOW_RELEASE_CLOBBER=1 to overwrite deliberately." >&2
+    echo "       Publish a new version tag; existing executable assets cannot be overwritten." >&2
     exit 1
   fi
 }
@@ -185,6 +176,11 @@ cleanup_staging() {
     return
   fi
   rm -rf "${STAGING_ROOT}"
+  if [ "${TARGET_MANIFEST_STAGED}" = "1" ] && \
+     ! cmp -s "${AGENT_TARGET_MANIFEST}" "${OUT_DIR}/wait-agent-targets.tsv"; then
+    echo "ERROR: Agent target manifest was lost while cleaning the staging workspace" >&2
+    return 1
+  fi
 }
 trap cleanup_staging EXIT
 
@@ -204,6 +200,10 @@ write_provenance_metadata() {
   local main_go_version
   local agent_go_version
   local web_revision
+	local agent_release_required_json="false"
+	if [ "${AGENT_RELEASE_REQUIRED}" = "1" ]; then
+		agent_release_required_json="true"
+	fi
   node_version="$(node -v)"
   npm_version="$(npm -v)"
   main_go_version="$(cd "${MAIN_DIR}" && go env GOVERSION)"
@@ -246,6 +246,12 @@ write_provenance_metadata() {
     "canonical_wait_main_repo": "${MAIN_PRIVATE_REPO}",
     "canonical_wait_agent_repo": "${AGENT_PRIVATE_REPO}",
     "public_installer_repo": "${PUBLIC_RELEASE_REPO}"
+  },
+  "release_plan": {
+    "agent_release_required": ${agent_release_required_json},
+    "public_agent_tag": "${PUBLIC_AGENT_TAG}",
+    "main_version_reason": "${MAIN_VERSION_REASON}",
+    "agent_version_reason": "${AGENT_VERSION_REASON}"
   }
 }
 EOF
@@ -266,6 +272,62 @@ write_sha256_sidecar() {
   local file_path="$1"
   local output_path="$2"
   printf '%s\n' "$(sha256_file "${file_path}")" > "${output_path}"
+}
+
+agent_update_sequence() {
+  local version="$1"
+  if [[ ! "${version}" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+    echo "ERROR: cannot derive Agent update sequence from ${version}" >&2
+    exit 1
+  fi
+  local major minor patch
+  major=$((10#${BASH_REMATCH[1]}))
+  minor=$((10#${BASH_REMATCH[2]}))
+  patch=$((10#${BASH_REMATCH[3]}))
+  if [ "${major}" -ge 1000000 ] || [ "${minor}" -ge 1000000 ] || [ "${patch}" -ge 1000000 ]; then
+    echo "ERROR: Agent version components must be below 1000000 for monotonic update sequencing" >&2
+    exit 1
+  fi
+  printf '%s\n' "$((major * 1000000000000 + minor * 1000000 + patch))"
+}
+
+write_agent_update_manifest() {
+  local output_path="$1"
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "ERROR: jq is required to generate the signed Agent update manifest" >&2
+    exit 1
+  fi
+  local targets_json='[]'
+  local spec target goos goarch filename file_path length digest
+  for spec in "${AGENT_TARGETS[@]}"; do
+    IFS='|' read -r goos goarch filename _installer <<< "$spec"
+    target="${goos}/${goarch}"
+    file_path="${AGENT_BUILD_DIR}/${filename}"
+    if [ ! -f "${file_path}" ]; then
+      echo "ERROR: Agent update target is missing: ${file_path}" >&2
+      exit 1
+    fi
+    length="$(wc -c < "${file_path}" | tr -d '[:space:]')"
+    digest="$(sha256_file "${file_path}")"
+    targets_json="$(jq -cn \
+      --argjson current "${targets_json}" \
+      --arg target "${target}" \
+      --arg filename "${filename}" \
+      --argjson length "${length}" \
+      --arg sha256 "${digest}" \
+      '$current + [{target: $target, filename: $filename, length: $length, sha256: $sha256}]')"
+  done
+  local sequence
+  sequence="$(agent_update_sequence "${AGENT_VERSION}")"
+  jq -cnS \
+    --arg repository "${PUBLIC_RELEASE_REPO}" \
+    --arg schema "wait-agent-update/v1" \
+    --argjson sequence "${sequence}" \
+    --arg tag "${PUBLIC_AGENT_TAG}" \
+    --argjson targets "${targets_json}" \
+    --arg version "${AGENT_VERSION}" \
+    '{repository: $repository, schema: $schema, sequence: $sequence, tag: $tag, targets: $targets, version: $version}' \
+    > "${output_path}"
 }
 
 normalize_pem_to_one_line() {
@@ -427,6 +489,8 @@ if [ ! -f "${VERSION_PLAN_LIB}" ]; then
   exit 1
 fi
 # shellcheck source=release-version-plan.sh
+# The validated path is selected at runtime.
+# shellcheck disable=SC1091
 source "${VERSION_PLAN_LIB}"
 resolve_release_version_plan \
   "${CURRENT_MAIN_VERSION}" \
@@ -466,18 +530,24 @@ PUBLIC_AGENT_TAG="agent-${AGENT_VERSION}"
 MAIN_GIT_HASH="${MAIN_GIT_HASH:-$(git -C "${MAIN_DIR}" rev-parse --short HEAD)}"
 PUBLISH_RELEASES="${PUBLISH_RELEASES:-1}"
 ALLOW_RELEASE_CLOBBER="${ALLOW_RELEASE_CLOBBER:-0}"
+RELEASE_BUILD_ONLY="${RELEASE_BUILD_ONLY:-0}"
 
-if [ "${REUSE_RELEASE_VERSIONS}" = "1" ] && [ "${ALLOW_RELEASE_CLOBBER}" != "1" ]; then
-  echo "ERROR: REUSE_RELEASE_VERSIONS=1 requires ALLOW_RELEASE_CLOBBER=1 because existing releases will be replaced." >&2
+if [ "${RELEASE_BUILD_ONLY}" = "1" ] && [ "${PUBLISH_RELEASES}" = "1" ]; then
+  echo "ERROR: RELEASE_BUILD_ONLY=1 cannot publish releases." >&2
   exit 1
 fi
-if [ "${PUBLISH_RELEASES}" = "1" ] && [ "${ALLOW_RELEASE_CLOBBER}" != "1" ]; then
+
+if [ "${REUSE_RELEASE_VERSIONS}" != "0" ] || [ "${ALLOW_RELEASE_CLOBBER}" != "0" ]; then
+  echo "ERROR: release version reuse and asset clobber are no longer supported; publish a new monotonically increasing version." >&2
+  exit 1
+fi
+if [ "${PUBLISH_RELEASES}" = "1" ]; then
   if [ "${MAIN_VERSION}" = "v${CURRENT_MAIN_VERSION}" ]; then
-    echo "ERROR: publishing the current main version requires ALLOW_RELEASE_CLOBBER=1." >&2
+    echo "ERROR: publishing the current main version is forbidden; choose a higher version." >&2
     exit 1
   fi
   if [ "${AGENT_RELEASE_REQUIRED}" = "1" ] && [ "${AGENT_VERSION}" = "v${CURRENT_AGENT_VERSION}" ]; then
-    echo "ERROR: republishing the current agent version requires ALLOW_RELEASE_CLOBBER=1." >&2
+    echo "ERROR: republishing the current agent version is forbidden; choose a higher version." >&2
     exit 1
   fi
 fi
@@ -516,12 +586,50 @@ MAIN_TARGETS=(
   "linux arm64"
 )
 
-AGENT_TARGETS=(
-  "linux amd64"
-  "linux arm64"
-  "windows amd64"
-  "windows arm64"
-)
+load_agent_targets() {
+  if [ ! -f "${AGENT_TARGET_MANIFEST}" ]; then
+    echo "ERROR: Agent target manifest is missing: ${AGENT_TARGET_MANIFEST}" >&2
+    exit 1
+  fi
+
+  AGENT_TARGETS=()
+  local schema goos goarch filename ci publish installer self_update
+  local target_header
+  IFS= read -r target_header < "${AGENT_TARGET_MANIFEST}"
+  if [ "${target_header}" != $'schema\tos\tarch\tfilename\tci\tpublish\tinstaller\tself_update' ]; then
+    echo "ERROR: invalid Agent target manifest header" >&2
+    exit 1
+  fi
+  while IFS=$'\t' read -r schema goos goarch filename ci publish installer self_update; do
+    if [ "${schema}" != "wait-agent-targets/v1" ]; then
+      echo "ERROR: invalid Agent target schema: ${schema}" >&2
+      exit 1
+    fi
+    if [[ ! "${goos}" =~ ^[a-z0-9]+$ ]] || [[ ! "${goarch}" =~ ^[a-z0-9]+$ ]] || \
+       [[ ! "${filename}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      echo "ERROR: invalid Agent target row: ${goos}/${goarch} ${filename}" >&2
+      exit 1
+    fi
+    if [ "${publish}" = "true" ]; then
+      if [ "${ci}" != "true" ] || [ "${self_update}" != "true" ] || [ "${installer}" = "none" ]; then
+        echo "ERROR: published Agent target ${goos}/${goarch} lacks ci/installer/self_update" >&2
+        exit 1
+      fi
+      AGENT_TARGETS+=("${goos}|${goarch}|${filename}|${installer}")
+    elif [ "${publish}" != "false" ]; then
+      echo "ERROR: invalid publish value for Agent target ${goos}/${goarch}: ${publish}" >&2
+      exit 1
+    fi
+  done < <(tail -n +2 "${AGENT_TARGET_MANIFEST}")
+  if [ "${#AGENT_TARGETS[@]}" -eq 0 ]; then
+    echo "ERROR: Agent target manifest contains no published targets" >&2
+    exit 1
+  fi
+}
+
+# review-2026-08-17 P2-15: every release consumer uses this one manifest.
+load_agent_targets
+"${AGENT_DIR}/scripts/verify-release-targets.sh" --release-dir "${INSTALLER_DIR}"
 
 validate_git_cleanliness "${MAIN_DIR}" "wait-main"
 validate_git_cleanliness "${AGENT_DIR}" "wait-agent-main"
@@ -568,8 +676,12 @@ validate_commit_pushed "${MAIN_DIR}" "wait-main" "${MAIN_COMMIT}"
 validate_commit_pushed "${AGENT_DIR}" "wait-agent-main" "${AGENT_COMMIT}"
 validate_commit_pushed "${WEB_DIR}" "wait-web-next" "${WEB_COMMIT}"
 
+if [ -z "${OUT_DIR}" ] || [ "${OUT_DIR}" = "/" ] || [ "${OUT_DIR}" = "${ROOT_DIR}" ] || [ "${OUT_DIR}" = "${HOME:-}" ]; then
+  echo "ERROR: refusing unsafe release output directory: ${OUT_DIR:-<empty>}" >&2
+  exit 1
+fi
+rm -rf "${OUT_DIR}"
 mkdir -p "${OUT_DIR}" "${STAGING_ROOT}"
-rm -rf "${MAIN_BUILD_DIR}" "${AGENT_BUILD_DIR}" "${WEB_BUILD_DIR}" "${OUT_DIR}/.staging"
 mkdir -p "${MAIN_BUILD_DIR}" "${AGENT_BUILD_DIR}" "${WEB_BUILD_DIR}"
 
 # --- 质量门：发布前强制运行测试与静态分析 ---
@@ -612,10 +724,6 @@ else
   npm run build --prefix "${WEB_DIR}"
 fi
 
-# Frontend build hooks have finished before any dry-run key is generated or a configured
-# release key is validated/read. CI additionally builds the frontend in a credential-free step.
-prepare_release_signing_key
-
 printf '\n==> [2/6] Build wait-main in staging workspace\n'
 rm -rf "${MAIN_STAGING_DIR}"
 mkdir -p "${MAIN_STAGING_DIR}"
@@ -655,12 +763,7 @@ printf '\n==> [4/6] Build wait-agent binaries\n'
   rm -rf build
   mkdir -p build
   for target in "${AGENT_TARGETS[@]}"; do
-    GOOS="${target%% *}"
-    GOARCH="${target##* }"
-    BIN_NAME="wait-agent-${GOOS}-${GOARCH}"
-    if [ "${GOOS}" = "windows" ]; then
-      BIN_NAME="${BIN_NAME}.exe"
-    fi
+    IFS='|' read -r GOOS GOARCH BIN_NAME _installer <<< "$target"
     echo "Building ${BIN_NAME}"
     env GOOS="${GOOS}" GOARCH="${GOARCH}" CGO_ENABLED=0 \
       go build -trimpath -ldflags="-X github.com/wait/wait-agent/update.CurrentVersion=${AGENT_VERSION_LDFLAGS}" -o "./build/${BIN_NAME}" .
@@ -671,12 +774,16 @@ cp -R "${AGENT_DIR}/build/." "${AGENT_BUILD_DIR}/"
 printf '\n==> [5/6] Copy notices and generate manifest\n'
 cp "${MAIN_STAGING_DIR}/LICENSE" "${OUT_DIR}/LICENSE.wait-main"
 cp "${AGENT_DIR}/LICENSE" "${OUT_DIR}/LICENSE.wait-agent"
+cp "${INSTALLER_DIR}/install-wait.sh" "${OUT_DIR}/install-wait.sh"
+cp "${INSTALLER_DIR}/install-agent.sh" "${OUT_DIR}/install-agent.sh"
+cp "${AGENT_TARGET_MANIFEST}" "${OUT_DIR}/wait-agent-targets.tsv"
 [ -f "${MAIN_STAGING_DIR}/NOTICE" ] && cp "${MAIN_STAGING_DIR}/NOTICE" "${OUT_DIR}/NOTICE.wait-main" || true
 [ -f "${AGENT_DIR}/NOTICE" ] && cp "${AGENT_DIR}/NOTICE" "${OUT_DIR}/NOTICE.wait-agent" || true
 write_go_module_inventory "${MAIN_STAGING_DIR}" "${OUT_DIR}/SBOM.wait-main.go-modules.txt"
 write_go_module_inventory "${AGENT_DIR}" "${OUT_DIR}/SBOM.wait-agent.go-modules.txt"
 write_npm_inventory "${WEB_DIR}" "${OUT_DIR}/SBOM.wait-web-next.npm.json"
 write_provenance_metadata "${OUT_DIR}/PROVENANCE.json"
+write_agent_update_manifest "${OUT_DIR}/wait-agent-update.json"
 
 cat > "${OUT_DIR}/MANIFEST.txt" <<EOF
 Main Version: ${MAIN_VERSION}
@@ -694,10 +801,16 @@ Artifacts:
 - SBOM.wait-agent.go-modules.txt
 - SBOM.wait-web-next.npm.json
 - PROVENANCE.json
+- wait-agent-update.json
+- wait-agent-update.json.sig
+- wait-agent-targets.tsv
+- wait-agent-targets.tsv.sig
+- install-wait.sh
+- install-agent.sh
 - SHA256SUMS.txt
 - SHA256SUMS.txt.sig
 - RELEASE_PUBKEY.pem
-- release signing mode: ${RELEASE_SIGNING_MODE}
+- release signing mode: $([ "${RELEASE_BUILD_ONLY}" = "1" ] && printf '%s' "unsigned-build" || printf '%s' "${RELEASE_SIGNING_MODE}")
 
 Release publish targets:
 - canonical wait-monitor release tags and source of truth: ${MAIN_PRIVATE_REPO} (${MAIN_VERSION})
@@ -713,7 +826,7 @@ Release publish targets:
   - WAIT_RELEASE_SIGNING_KEY
 EOF
 
-# agent 版本指针（review-2026-07-26 P0-6）
+# agent 版本指针（review-2026-07-26 P0-6 / review-2026-08-16 P1-4）
 #
 # 公开镜像仓库里同时躺着两条独立的版本线：主控的 v<MAIN> 和 agent 的 v<AGENT>。
 # agent 版本指针：公开镜像里有主控和 agent 两条独立的版本线，"取仓库里最新的
@@ -721,12 +834,49 @@ EOF
 # 把自身版本跳到主控版本线上。这个指针文件随 latest（主控 tag）发布，让 agent 先确定
 # 属于自己那条线的版本，再拼出 agent-<version> 精确取该 release
 # （见 update/update.go 的 defaultFetchAgentVersionPointer / agentMirrorTag）。
-# 它必须在 SHA256SUMS 计算之前写好，才能被校验覆盖。
+# 指针只负责定位 agent-prefixed tag。该 tag 内的 wait-agent-update.json 及其
+# 签名才是更新授权：它绑定版本、单调序列、仓库、tag、target、文件名、长度和摘要。
+# 指针与 manifest 都必须在 SHA256SUMS 计算之前写好，才能被发布闭包覆盖。
 printf '%s\n' "${AGENT_VERSION}" > "${OUT_DIR}/wait-agent-version.txt"
+
+if ! cmp -s "${AGENT_TARGET_MANIFEST}" "${OUT_DIR}/wait-agent-targets.tsv"; then
+  echo "ERROR: staged Agent target manifest is missing or differs from the source contract" >&2
+  exit 1
+fi
+TARGET_MANIFEST_STAGED=1
+
+assert_staged_agent_target_manifest() {
+  local phase="$1"
+  if ! cmp -s "${AGENT_TARGET_MANIFEST}" "${OUT_DIR}/wait-agent-targets.tsv"; then
+    echo "ERROR: staged Agent target manifest was lost during ${phase}" >&2
+    exit 1
+  fi
+}
+
+SIDE_CAR_TARGETS=()
+for target in "${AGENT_TARGETS[@]}"; do
+  IFS='|' read -r _goos _goarch filename _installer <<< "$target"
+  SIDE_CAR_TARGETS+=("${AGENT_BUILD_DIR}/${filename}")
+done
+for file_path in "${SIDE_CAR_TARGETS[@]}"; do
+  if [ -f "${file_path}" ]; then
+    write_sha256_sidecar "${file_path}" "${file_path}.sha256"
+  fi
+done
+assert_staged_agent_target_manifest "Agent sidecar generation"
 
 CHECKSUM_INPUTS=()
 rm -f "${OUT_DIR}/SHA256SUMS.txt" "${OUT_DIR}/SHA256SUMS.txt.sig" "${OUT_DIR}/${RELEASE_SIGNING_PUBKEY_ASSET}"
-write_release_public_key "${OUT_DIR}/${RELEASE_SIGNING_PUBKEY_ASSET}"
+assert_staged_agent_target_manifest "checksum reset"
+if [ "${RELEASE_BUILD_ONLY}" != "1" ]; then
+  # The key is prepared only after all repository-controlled build hooks and
+  # compilers have finished. CI uses RELEASE_BUILD_ONLY=1 and signs in a
+  # separate job that never checks out or executes product source.
+  # review-2026-08-17 P0-1
+  prepare_release_signing_key
+  write_release_public_key "${OUT_DIR}/${RELEASE_SIGNING_PUBKEY_ASSET}"
+fi
+assert_staged_agent_target_manifest "release key preparation"
 while IFS= read -r file_path; do
   CHECKSUM_INPUTS+=("${file_path}")
 done < <(find "${OUT_DIR}" -path "${OUT_DIR}/.staging" -prune -o -type f ! -name 'SHA256SUMS.txt' ! -name '*.sig' -print | LC_ALL=C sort)
@@ -735,33 +885,31 @@ if [ "${#CHECKSUM_INPUTS[@]}" -eq 0 ]; then
   exit 1
 fi
 write_sha256sums "${OUT_DIR}/SHA256SUMS.txt" "${CHECKSUM_INPUTS[@]}"
+assert_staged_agent_target_manifest "checksum generation"
 
-SIGNATURE_TARGETS=(
-  "${MAIN_BUILD_DIR}/wait-linux-amd64"
-  "${MAIN_BUILD_DIR}/wait-linux-arm64"
-  "${AGENT_BUILD_DIR}/wait-agent-linux-amd64"
-  "${AGENT_BUILD_DIR}/wait-agent-linux-arm64"
-  "${AGENT_BUILD_DIR}/wait-agent-windows-amd64.exe"
-  "${AGENT_BUILD_DIR}/wait-agent-windows-arm64.exe"
-  "${OUT_DIR}/SHA256SUMS.txt"
-)
-for file_path in "${SIGNATURE_TARGETS[@]}"; do
-  if [ -f "${file_path}" ]; then
+if [ "${RELEASE_BUILD_ONLY}" != "1" ]; then
+  SIGNATURE_TARGETS=(
+    "${MAIN_BUILD_DIR}/wait-linux-amd64"
+    "${MAIN_BUILD_DIR}/wait-linux-arm64"
+    "${OUT_DIR}/install-wait.sh"
+    "${OUT_DIR}/install-agent.sh"
+    "${OUT_DIR}/wait-agent-update.json"
+    "${OUT_DIR}/wait-agent-targets.tsv"
+    "${OUT_DIR}/SHA256SUMS.txt"
+  )
+  for target in "${AGENT_TARGETS[@]}"; do
+    IFS='|' read -r _goos _goarch filename _installer <<< "$target"
+    SIGNATURE_TARGETS+=("${AGENT_BUILD_DIR}/${filename}")
+  done
+  for file_path in "${SIGNATURE_TARGETS[@]}"; do
+    if [ ! -f "${file_path}" ]; then
+      echo "ERROR: required release signature target is missing: ${file_path}" >&2
+      exit 1
+    fi
     sign_release_asset "${file_path}" "${file_path}.sig"
-  fi
-done
-
-SIDE_CAR_TARGETS=(
-  "${AGENT_BUILD_DIR}/wait-agent-linux-amd64"
-  "${AGENT_BUILD_DIR}/wait-agent-linux-arm64"
-  "${AGENT_BUILD_DIR}/wait-agent-windows-amd64.exe"
-  "${AGENT_BUILD_DIR}/wait-agent-windows-arm64.exe"
-)
-for file_path in "${SIDE_CAR_TARGETS[@]}"; do
-  if [ -f "${file_path}" ]; then
-    write_sha256_sidecar "${file_path}" "${file_path}.sha256"
-  fi
-done
+  done
+fi
+assert_staged_agent_target_manifest "release signing"
 
 printf '\nRelease output ready: %s\n' "${OUT_DIR}"
 printf 'Main binaries: %s\n' "${MAIN_BUILD_DIR}"
@@ -770,6 +918,11 @@ printf 'Web snapshot: %s\n' "${WEB_BUILD_DIR}/dist"
 printf 'Version plan: main=%s (%s), agent=%s (%s), publish-agent=%s\n' \
   "${MAIN_VERSION}" "${MAIN_VERSION_REASON}" "${AGENT_VERSION}" "${AGENT_VERSION_REASON}" "${AGENT_RELEASE_REQUIRED}"
 printf 'Resolved versions: main=%s agent=%s\n' "${MAIN_VERSION}" "${AGENT_VERSION}"
+
+if [ "${RELEASE_BUILD_ONLY}" = "1" ]; then
+  printf '\nUnsigned build complete; signing and publishing are intentionally delegated to isolated jobs.\n'
+  exit 0
+fi
 
 if [ "${PUBLISH_RELEASES}" != "1" ]; then
   printf '\nSkipping GitHub Release publish because PUBLISH_RELEASES=%s\n' "${PUBLISH_RELEASES}"
@@ -799,18 +952,6 @@ MAIN_ASSETS=(
 append_asset_if_exists MAIN_ASSETS "${OUT_DIR}/NOTICE.wait-main"
 
 AGENT_ASSETS=(
-  "${AGENT_BUILD_DIR}/wait-agent-linux-amd64"
-  "${AGENT_BUILD_DIR}/wait-agent-linux-amd64.sha256"
-  "${AGENT_BUILD_DIR}/wait-agent-linux-arm64"
-  "${AGENT_BUILD_DIR}/wait-agent-linux-arm64.sha256"
-  "${AGENT_BUILD_DIR}/wait-agent-windows-amd64.exe"
-  "${AGENT_BUILD_DIR}/wait-agent-windows-amd64.exe.sha256"
-  "${AGENT_BUILD_DIR}/wait-agent-windows-arm64.exe"
-  "${AGENT_BUILD_DIR}/wait-agent-windows-arm64.exe.sha256"
-  "${AGENT_BUILD_DIR}/wait-agent-linux-amd64.sig"
-  "${AGENT_BUILD_DIR}/wait-agent-linux-arm64.sig"
-  "${AGENT_BUILD_DIR}/wait-agent-windows-amd64.exe.sig"
-  "${AGENT_BUILD_DIR}/wait-agent-windows-arm64.exe.sig"
   "${OUT_DIR}/LICENSE.wait-agent"
   "${OUT_DIR}/MANIFEST.txt"
   "${OUT_DIR}/SHA256SUMS.txt"
@@ -818,7 +959,19 @@ AGENT_ASSETS=(
   "${OUT_DIR}/${RELEASE_SIGNING_PUBKEY_ASSET}"
   "${OUT_DIR}/PROVENANCE.json"
   "${OUT_DIR}/SBOM.wait-agent.go-modules.txt"
+  "${OUT_DIR}/wait-agent-update.json"
+  "${OUT_DIR}/wait-agent-update.json.sig"
+  "${OUT_DIR}/wait-agent-targets.tsv"
+  "${OUT_DIR}/wait-agent-targets.tsv.sig"
 )
+for target in "${AGENT_TARGETS[@]}"; do
+  IFS='|' read -r _goos _goarch filename _installer <<< "$target"
+  AGENT_ASSETS+=(
+    "${AGENT_BUILD_DIR}/${filename}"
+    "${AGENT_BUILD_DIR}/${filename}.sha256"
+    "${AGENT_BUILD_DIR}/${filename}.sig"
+  )
+done
 append_asset_if_exists AGENT_ASSETS "${OUT_DIR}/NOTICE.wait-agent"
 
 PUBLIC_ASSETS=(
@@ -826,18 +979,6 @@ PUBLIC_ASSETS=(
   "${MAIN_BUILD_DIR}/wait-linux-amd64.sig#wait-linux-amd64.sig"
   "${MAIN_BUILD_DIR}/wait-linux-arm64#wait-linux-arm64"
   "${MAIN_BUILD_DIR}/wait-linux-arm64.sig#wait-linux-arm64.sig"
-  "${AGENT_BUILD_DIR}/wait-agent-linux-amd64#wait-agent-linux-amd64"
-  "${AGENT_BUILD_DIR}/wait-agent-linux-amd64.sig#wait-agent-linux-amd64.sig"
-  "${AGENT_BUILD_DIR}/wait-agent-linux-amd64.sha256#wait-agent-linux-amd64.sha256"
-  "${AGENT_BUILD_DIR}/wait-agent-linux-arm64#wait-agent-linux-arm64"
-  "${AGENT_BUILD_DIR}/wait-agent-linux-arm64.sig#wait-agent-linux-arm64.sig"
-  "${AGENT_BUILD_DIR}/wait-agent-linux-arm64.sha256#wait-agent-linux-arm64.sha256"
-  "${AGENT_BUILD_DIR}/wait-agent-windows-amd64.exe#wait-agent-windows-amd64.exe"
-  "${AGENT_BUILD_DIR}/wait-agent-windows-amd64.exe.sig#wait-agent-windows-amd64.exe.sig"
-  "${AGENT_BUILD_DIR}/wait-agent-windows-amd64.exe.sha256#wait-agent-windows-amd64.exe.sha256"
-  "${AGENT_BUILD_DIR}/wait-agent-windows-arm64.exe#wait-agent-windows-arm64.exe"
-  "${AGENT_BUILD_DIR}/wait-agent-windows-arm64.exe.sig#wait-agent-windows-arm64.exe.sig"
-  "${AGENT_BUILD_DIR}/wait-agent-windows-arm64.exe.sha256#wait-agent-windows-arm64.exe.sha256"
   "${OUT_DIR}/LICENSE.wait-main#LICENSE.wait-main"
   "${OUT_DIR}/LICENSE.wait-agent#LICENSE.wait-agent"
   "${OUT_DIR}/MANIFEST.txt#MANIFEST.txt"
@@ -849,7 +990,23 @@ PUBLIC_ASSETS=(
   "${OUT_DIR}/SBOM.wait-agent.go-modules.txt#SBOM.wait-agent.go-modules.txt"
   "${OUT_DIR}/SBOM.wait-web-next.npm.json#SBOM.wait-web-next.npm.json"
   "${OUT_DIR}/wait-agent-version.txt#wait-agent-version.txt"
+  "${OUT_DIR}/wait-agent-update.json#wait-agent-update.json"
+  "${OUT_DIR}/wait-agent-update.json.sig#wait-agent-update.json.sig"
+  "${OUT_DIR}/wait-agent-targets.tsv#wait-agent-targets.tsv"
+  "${OUT_DIR}/wait-agent-targets.tsv.sig#wait-agent-targets.tsv.sig"
+  "${OUT_DIR}/install-wait.sh#install-wait.sh"
+  "${OUT_DIR}/install-wait.sh.sig#install-wait.sh.sig"
+  "${OUT_DIR}/install-agent.sh#install-agent.sh"
+  "${OUT_DIR}/install-agent.sh.sig#install-agent.sh.sig"
 )
+for target in "${AGENT_TARGETS[@]}"; do
+  IFS='|' read -r _goos _goarch filename _installer <<< "$target"
+  PUBLIC_ASSETS+=(
+    "${AGENT_BUILD_DIR}/${filename}#${filename}"
+    "${AGENT_BUILD_DIR}/${filename}.sig#${filename}.sig"
+    "${AGENT_BUILD_DIR}/${filename}.sha256#${filename}.sha256"
+  )
+done
 append_asset_if_exists PUBLIC_ASSETS "${OUT_DIR}/NOTICE.wait-main" "NOTICE.wait-main"
 append_asset_if_exists PUBLIC_ASSETS "${OUT_DIR}/NOTICE.wait-agent" "NOTICE.wait-agent"
 
@@ -860,18 +1017,6 @@ append_asset_if_exists PUBLIC_ASSETS "${OUT_DIR}/NOTICE.wait-agent" "NOTICE.wait
 # 主控 tag 的 release 仍然保持 latest（两个安装脚本都靠 latest/download 取资产），
 # 所以这里**不**从 PUBLIC_ASSETS 里移除 agent 资产。
 PUBLIC_AGENT_ASSETS=(
-  "${AGENT_BUILD_DIR}/wait-agent-linux-amd64#wait-agent-linux-amd64"
-  "${AGENT_BUILD_DIR}/wait-agent-linux-amd64.sig#wait-agent-linux-amd64.sig"
-  "${AGENT_BUILD_DIR}/wait-agent-linux-amd64.sha256#wait-agent-linux-amd64.sha256"
-  "${AGENT_BUILD_DIR}/wait-agent-linux-arm64#wait-agent-linux-arm64"
-  "${AGENT_BUILD_DIR}/wait-agent-linux-arm64.sig#wait-agent-linux-arm64.sig"
-  "${AGENT_BUILD_DIR}/wait-agent-linux-arm64.sha256#wait-agent-linux-arm64.sha256"
-  "${AGENT_BUILD_DIR}/wait-agent-windows-amd64.exe#wait-agent-windows-amd64.exe"
-  "${AGENT_BUILD_DIR}/wait-agent-windows-amd64.exe.sig#wait-agent-windows-amd64.exe.sig"
-  "${AGENT_BUILD_DIR}/wait-agent-windows-amd64.exe.sha256#wait-agent-windows-amd64.exe.sha256"
-  "${AGENT_BUILD_DIR}/wait-agent-windows-arm64.exe#wait-agent-windows-arm64.exe"
-  "${AGENT_BUILD_DIR}/wait-agent-windows-arm64.exe.sig#wait-agent-windows-arm64.exe.sig"
-  "${AGENT_BUILD_DIR}/wait-agent-windows-arm64.exe.sha256#wait-agent-windows-arm64.exe.sha256"
   "${OUT_DIR}/LICENSE.wait-agent#LICENSE.wait-agent"
   "${OUT_DIR}/SHA256SUMS.txt#SHA256SUMS.txt"
   "${OUT_DIR}/SHA256SUMS.txt.sig#SHA256SUMS.txt.sig"
@@ -879,7 +1024,19 @@ PUBLIC_AGENT_ASSETS=(
   "${OUT_DIR}/PROVENANCE.json#PROVENANCE.json"
   "${OUT_DIR}/SBOM.wait-agent.go-modules.txt#SBOM.wait-agent.go-modules.txt"
   "${OUT_DIR}/wait-agent-version.txt#wait-agent-version.txt"
+  "${OUT_DIR}/wait-agent-update.json#wait-agent-update.json"
+  "${OUT_DIR}/wait-agent-update.json.sig#wait-agent-update.json.sig"
+  "${OUT_DIR}/wait-agent-targets.tsv#wait-agent-targets.tsv"
+  "${OUT_DIR}/wait-agent-targets.tsv.sig#wait-agent-targets.tsv.sig"
 )
+for target in "${AGENT_TARGETS[@]}"; do
+  IFS='|' read -r _goos _goarch filename _installer <<< "$target"
+  PUBLIC_AGENT_ASSETS+=(
+    "${AGENT_BUILD_DIR}/${filename}#${filename}"
+    "${AGENT_BUILD_DIR}/${filename}.sig#${filename}.sig"
+    "${AGENT_BUILD_DIR}/${filename}.sha256#${filename}.sha256"
+  )
+done
 append_asset_if_exists PUBLIC_AGENT_ASSETS "${OUT_DIR}/NOTICE.wait-agent" "NOTICE.wait-agent"
 
 MAIN_NOTES="$(cat <<EOF
