@@ -252,3 +252,19 @@ http://<server-ip>:25774
 ```
 
 The Agent should normally be installed from the admin panel, which generates the correct endpoint and token command for each node.
+
+## 本地统一质量门禁
+
+`quality-check.sh` 是三端与营销站的本地统一门禁。将相关仓库按
+`wait-main/`、`wait-agent-main/`、`wait-web-next/`、`wait-website/`、`wait-release/`
+放在同一工作区后，在工作区根目录运行：
+
+```bash
+cp wait-release/quality-check.sh ./quality-check.sh
+./quality-check.sh
+```
+
+使用前端 `.nvmrc` 指定的 Node 22 工具链；Go 版本由各项目的 `toolchain` 固定。
+脚本会提示需要安装的 govulncheck 与 actionlint 版本。门禁逐个检查 Shell 脚本，
+并检查 Go 测试/race/vet/已知漏洞、前端干净安装/依赖审计/构建/lint/测试及安装 smoke。
+根目录副本必须与本仓库中的版本保持一致；子进程保留调用者选择的 PATH。
