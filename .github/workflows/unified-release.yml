@@ -201,7 +201,12 @@ jobs:
           fi
           {
             echo "MAIN_VERSION=${MAIN_VERSION}"
-            echo "AGENT_VERSION=${AGENT_VERSION}"
+            # review-2026-09-26: export AGENT_VERSION only when the plan requires an agent release; empty keeps release-unified.sh on the auto path so unchanged agent source does not force one.
+            if [ "${AGENT_RELEASE_REQUIRED}" = "1" ]; then
+              echo "AGENT_VERSION=${AGENT_VERSION}"
+            else
+              echo "AGENT_VERSION="
+            fi
             echo "CURRENT_AGENT_COMMIT=${current_agent_commit}"
           } >> "${GITHUB_ENV}"
 
