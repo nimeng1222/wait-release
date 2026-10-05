@@ -109,6 +109,32 @@ sudo bash install-agent.sh \
   --install-service-name "wait-agent"
 ```
 
+Agent 的 systemd 服务与主控 unit 对齐并更严：`ProtectSystem=strict` 下唯一可写路径是安装
+目录（自更新产物写在这里），并额外启用 `RestrictAddressFamilies`（含 `AF_NETLINK`，网卡
+接口枚举与 TCP/UDP 连接计数采集需要）、`RestrictNamespaces`、
+`SystemCallArchitectures=native`、`MemoryDenyWriteExecute`。
+
+## 卸载 Agent
+
+远程卸载通道已移除。卸载必须在节点本地以 root 执行，一条命令完成，可重复执行（幂等）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nimeng1222/wait-release/v0.1.72/install-agent.sh -o install-agent.sh
+sudo bash install-agent.sh --uninstall
+```
+
+自定义过安装参数时，须带上与安装时一致的 `--install-dir` / `--install-service-name`。
+
+卸载覆盖范围：
+
+| 项目 | 处理 |
+| --- | --- |
+| systemd 服务 | stop / disable / 删除 unit 文件 / daemon-reload / reset-failed |
+| 安装目录 | 整目录删除：二进制、env（600）、自更新产物（`*.prev`、`*.pending_update`、`*.update_state.json`）、运行状态文件（`auto-discovery.json`） |
+| 老版本残留 | 删除 `/var/lib/wait-agent`、`/etc/wait-agent`（含旧版 `net_static.json`） |
+| 系统用户 | 确认无 `wait-agent` 用户进程后 `userdel`（有进程则跳过并提示，处理后重跑即可） |
+| journald 日志 | `journalctl --rotate`。journald 不支持按 unit 清理（`--vacuum-*` 只作用于归档文件且不能与 `--unit` 组合）；如接受整机范围清理，设置 `WAIT_AGENT_JOURNAL_VACUUM_TIME=1s` 让卸载额外执行 `journalctl --vacuum-time=1s` |
+
 ## 环境变量
 
 主控安装脚本：
@@ -125,6 +151,7 @@ Agent 安装脚本：
 | `WAIT_AGENT_RELEASE_REPO_URL` | Agent 二进制下载源，默认使用本仓库 release |
 | `WAIT_AGENT_SKIP_CHECKSUM` | （已弃用）设置为 `1` 跳过 SHA-256 完整性校验，不推荐，仅用于紧急排障。旧实现会连带跳过签名校验，现已拆分为独立变量。 |
 | `WAIT_AGENT_SKIP_SIGNATURE` | 设置为 `1` 跳过 ECDSA 签名校验，与 `WAIT_AGENT_SKIP_CHECKSUM` 独立。不推荐，仅用于紧急排障。 |
+| `WAIT_AGENT_JOURNAL_VACUUM_TIME` | （仅 `--uninstall`）设置后卸载会额外执行 `journalctl --vacuum-time=<值>` 清理整机 journald 日志；不设置时只 rotate。journald 无按 unit 清理能力，详见「卸载 Agent」。 |
 
 ## 常用运维命令
 

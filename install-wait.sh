@@ -937,75 +937,43 @@ stop_service() {
 }
 
 # ── Uninstall agent ────────────────────────────────────────
+# Agent 卸载唯一入口是 canonical 的 install-agent.sh --uninstall（无痕卸载：systemd
+# unit、安装目录整体、老版本残留的状态/配置目录、系统用户 wait-agent，并 rotate
+# journald 日志）。本脚本不维护第二份卸载实现。
+#
+# 旧的內嵌清理逻辑已删：它遍历历史服务名列表、OpenRC、launchd 并散落 rm -rf，
+# 清理面弱于 canonical，与"唯一入口"矛盾。其中：
+#   - OpenRC/launchd 分支无人可达：canonical 安装器只装 systemd unit，
+#     wait-agent-main 从未提供 launchd/OpenRC 安装路径；
+#   - $HOME/.wait 是死代码：agent 从未使用该目录。
+# 节点上通常不会留下安装脚本（canonical 安装器只落盘二进制/env/unit），所以默认
+# 走"指引下载 canonical 脚本"路径；本地找到脚本时直接代为执行。自定义安装目录的
+# 机器可用 WAIT_AGENT_INSTALLER 指向对应脚本。
+# review-2026-10-05
+DEFAULT_AGENT_INSTALLER_PATH="/opt/wait/install-agent.sh"
+
 uninstall_agent() {
     echo
-    step "卸载 wait-agent"
+    step "卸载 wait-agent（无痕卸载：删除服务/用户/数据/日志）"
     echo
 
-    # Detect if there are any known agent service names
-    local agent_services=("wait-agent" "wait_monitor_agent")
-
-    local found_any=false
-    if check_systemd; then
-        for svc in "${agent_services[@]}"; do
-            if systemctl list-unit-files 2>/dev/null | grep -q "${svc}.service"; then
-                found_any=true
-                step "停止并移除 systemd 服务: $svc"
-                systemctl stop "${svc}.service" 2>/dev/null
-                systemctl disable "${svc}.service" 2>/dev/null
-                rm -f "/etc/systemd/system/${svc}.service"
-                ok "服务已移除: $svc"
-            fi
-        done
-        systemctl daemon-reload
+    local installer="${WAIT_AGENT_INSTALLER:-$DEFAULT_AGENT_INSTALLER_PATH}"
+    if [ -f "$installer" ]; then
+        step "使用节点上的 canonical 卸载入口: $installer"
+        bash "$installer" --uninstall
+        return
     fi
 
-    # Check for OpenRC services
-    for svc in "${agent_services[@]}"; do
-        if [ -f "/etc/init.d/${svc}" ]; then
-            found_any=true
-            rc-service "${svc}" stop 2>/dev/null
-            rc-update del "${svc}" default 2>/dev/null
-            rm -f "/etc/init.d/${svc}"
-            ok "服务已移除: $svc (OpenRC)"
-        fi
-    done
-
-    # Remove common install directories
-    local agent_dirs=("/opt/wait" "/opt/wait-agent" "/usr/local/wait" "$HOME/.wait")
-    for dir in "${agent_dirs[@]}"; do
-        if [ -d "$dir" ] && [ -f "$dir/agent" ]; then
-            found_any=true
-            rm -rf "$dir"
-            ok "目录已删除: $dir"
-        fi
-    done
-
-    # macOS launchd
-    if [ "$(uname -s)" = "Darwin" ]; then
-        local plists=(
-            "/Library/LaunchDaemons/com.wait.wait-agent.plist"
-            "$HOME/Library/LaunchAgents/com.wait.wait-agent.plist"
-        )
-        for plist in "${plists[@]}"; do
-            if [ -f "$plist" ]; then
-                found_any=true
-                launchctl bootout system "$plist" 2>/dev/null || true
-                launchctl bootout "gui/$(id -u)" "$plist" 2>/dev/null || true
-                rm -f "$plist"
-                ok "launchd 服务已移除: $plist"
-            fi
-        done
-    fi
-
-    if [ "$found_any" = true ]; then
-        echo
-        ok "wait-agent 卸载完成"
-    else
-        echo
-        warn "未发现已安装的 agent 痕迹"
-    fi
+    local installer_url
+    installer_url="$(build_download_url "install-agent.sh")"
+    warn "节点上未找到 canonical 安装脚本: $installer"
+    info "  请下载 canonical 脚本执行无痕卸载："
+    info "    ${CYAN}curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fL -o install-agent.sh \\${NC}"
+    info "        ${CYAN}${installer_url}${NC}"
+    info "    ${CYAN}sudo bash install-agent.sh --uninstall${NC}"
+    info "  安装时用过自定义参数的，卸载须保持一致：${CYAN}--install-dir <DIR> --install-service-name <NAME>${NC}"
     echo
+    return 1
 }
 
 # ── Main menu ──────────────────────────────────────────────
@@ -1020,7 +988,7 @@ main_menu() {
     info "  ${BOLD}5)${NC}  查看日志"
     info "  ${BOLD}6)${NC}  重启服务"
     info "  ${BOLD}7)${NC}  停止服务"
-    info "  ${BOLD}8)${NC}  卸载 agent"
+    info "  ${BOLD}8)${NC}  卸载 agent（无痕：删用户/数据/日志）"
     divider
     info "  ${BOLD}9)${NC}  退出"
     echo

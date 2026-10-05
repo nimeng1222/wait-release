@@ -185,6 +185,8 @@ run_installer() {
         WAIT_AGENT_INSTALLER_TEST_MODE=1 \
         WAIT_AGENT_INSTALLER_SYSTEMD_DIR="$SYSTEMD_DIR" \
         WAIT_AGENT_INSTALLER_PROC_ROOT="$PROC_ROOT" \
+        WAIT_AGENT_INSTALLER_AGENT_DATA_DIR="${CASE_ROOT}/legacy-state" \
+        WAIT_AGENT_INSTALLER_LEGACY_ETC_DIR="${CASE_ROOT}/legacy-etc" \
         WAIT_AGENT_INSTALLER_HEALTH_ATTEMPTS=2 \
         WAIT_AGENT_INSTALLER_HEALTH_POLL_INTERVAL=0 \
         WAIT_AGENT_RELEASE_REPO_URL="https://release.test/releases" \
@@ -199,6 +201,22 @@ run_installer() {
         "$INSTALLER" \
         --endpoint "$endpoint" \
         --token "$token" \
+        --install-dir "$INSTALL_DIR"
+}
+
+run_uninstaller() {
+    env \
+        PATH="${MOCK_BIN}:/usr/bin:/bin:/usr/sbin:/sbin" \
+        WAIT_AGENT_INSTALLER_TEST_MODE=1 \
+        WAIT_AGENT_INSTALLER_SYSTEMD_DIR="$SYSTEMD_DIR" \
+        WAIT_AGENT_INSTALLER_PROC_ROOT="$PROC_ROOT" \
+        WAIT_AGENT_INSTALLER_AGENT_DATA_DIR="${CASE_ROOT}/legacy-state" \
+        WAIT_AGENT_INSTALLER_LEGACY_ETC_DIR="${CASE_ROOT}/legacy-etc" \
+        WAIT_AGENT_RELEASE_REPO_URL="https://release.test/releases" \
+        MOCK_SYSTEMCTL_STATE_DIR="$STATE_DIR" \
+        MOCK_PROC_ROOT="$PROC_ROOT" \
+        "$INSTALLER" \
+        --uninstall \
         --install-dir "$INSTALL_DIR"
 }
 
@@ -281,10 +299,97 @@ test_special_character_serialization() {
     assert_file_contains "${CASE_ROOT}/effective-environ" "AGENT_TOKEN=$token"
 }
 
+test_unit_hardening() {
+    new_case unit-hardening
+    run_installer "https://hardening.example" "hardening-token" > "${CASE_ROOT}/installer.log" 2>&1
+    local unit="${SYSTEMD_DIR}/wait-agent.service"
+    local directive
+    for directive in \
+        'ProtectSystem=strict' \
+        'NoNewPrivileges=true' \
+        'PrivateTmp=true' \
+        'ProtectHome=true' \
+        'ProtectControlGroups=true' \
+        'ProtectKernelTunables=true' \
+        'ProtectKernelModules=true' \
+        'RestrictSUIDSGID=true' \
+        'LockPersonality=true' \
+        'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK' \
+        'RestrictNamespaces=true' \
+        'SystemCallArchitectures=native' \
+        'MemoryDenyWriteExecute=true'
+    do
+        assert_file_contains "$unit" "$directive"
+    done
+    assert_file_contains "$unit" "ReadWritePaths=\"${INSTALL_DIR}\""
+    if [[ "$(grep -c '^ReadWritePaths=' "$unit")" != "1" ]]; then
+        fail "unit must declare exactly one ReadWritePaths"
+    fi
+    if grep -Eq 'ProtectSystem=full|var/lib' "$unit"; then
+        fail "unit must not use ProtectSystem=full or reference var/lib"
+    fi
+}
+
+test_uninstall() {
+    new_case uninstall
+    seed_existing_install
+    # 自更新产物 + 旧版残留（目录路径经测试模式变量重定向到临时目录）
+    printf 'stale' > "${INSTALL_DIR}/agent.prev"
+    printf 'stale' > "${INSTALL_DIR}/agent.pending_update"
+    printf '{}' > "${INSTALL_DIR}/agent.update_state.json"
+    printf 'netstatic' > "${INSTALL_DIR}/net_static.json"
+    mkdir -p "${CASE_ROOT}/legacy-state" "${CASE_ROOT}/legacy-etc"
+    printf 'netstatic' > "${CASE_ROOT}/legacy-state/net_static.json"
+    printf 'netstatic' > "${CASE_ROOT}/legacy-etc/net_static.json"
+
+    if ! run_uninstaller > "${CASE_ROOT}/uninstall.log" 2>&1; then
+        cat "${CASE_ROOT}/uninstall.log" >&2
+        fail "uninstaller failed"
+    fi
+
+    [[ ! -e "$INSTALL_DIR" ]] || fail "install dir survived uninstall"
+    [[ ! -f "${SYSTEMD_DIR}/wait-agent.service" ]] || fail "unit file survived uninstall"
+    [[ ! -f "${STATE_DIR}/active" && ! -f "${STATE_DIR}/enabled" ]] \
+        || fail "service was not stopped/disabled"
+    [[ ! -e "${CASE_ROOT}/legacy-state" ]] || fail "legacy state dir survived uninstall"
+    [[ ! -e "${CASE_ROOT}/legacy-etc" ]] || fail "legacy etc dir survived uninstall"
+
+    # 幂等：对已卸载干净的环境重复执行仍成功
+    run_uninstaller > "${CASE_ROOT}/uninstall-again.log" 2>&1
+    [[ ! -e "$INSTALL_DIR" ]] || fail "idempotent reinstall of artifacts happened"
+}
+
+test_uninstall_rejects_protected_dir() {
+    # "/" 会被 validate_inputs 直接拒绝，走不到 remove_install_tree 的顶层防呆。
+    # /opt 能通过 validate_inputs（非 "/" 的绝对路径），从而真正覆盖防呆分支。
+    new_case uninstall-protected
+    if run_uninstaller_with_dir "/opt" > "${CASE_ROOT}/uninstall.log" 2>&1; then
+        fail "uninstall must refuse to remove /opt"
+    fi
+    assert_file_contains "${CASE_ROOT}/uninstall.log" "拒绝整目录删除受保护路径: /opt"
+}
+
+run_uninstaller_with_dir() {
+    env \
+        PATH="${MOCK_BIN}:/usr/bin:/bin:/usr/sbin:/sbin" \
+        WAIT_AGENT_INSTALLER_TEST_MODE=1 \
+        WAIT_AGENT_INSTALLER_SYSTEMD_DIR="$SYSTEMD_DIR" \
+        WAIT_AGENT_INSTALLER_PROC_ROOT="$PROC_ROOT" \
+        WAIT_AGENT_RELEASE_REPO_URL="https://release.test/releases" \
+        MOCK_SYSTEMCTL_STATE_DIR="$STATE_DIR" \
+        MOCK_PROC_ROOT="$PROC_ROOT" \
+        "$INSTALLER" \
+        --uninstall \
+        --install-dir "$1"
+}
+
 test_first_install
 test_upgrade
 test_credential_rotation_restarts
 test_health_failure_rolls_back
 test_special_character_serialization
+test_unit_hardening
+test_uninstall
+test_uninstall_rejects_protected_dir
 
 printf 'install-agent smoke tests passed\n'

@@ -125,6 +125,7 @@ installer_scripts=(
   "${ROOT_DIR}/wait-release/release-unified.sh"
   "${ROOT_DIR}/wait-release/publish-release-output.sh"
   "${ROOT_DIR}/wait-release/tests/install-agent-smoke.sh"
+  "${ROOT_DIR}/wait-release/tests/install-wait-smoke.sh"
 )
 # review-2026-09-20 R11: bash accepts only one script; remaining paths are arguments.
 for installer_script in "${installer_scripts[@]}"; do
@@ -148,6 +149,8 @@ run_step "release: Agent target manifest consistency" \
   --release-dir "${ROOT_DIR}/wait-release"
 run_step "installers: agent install/upgrade/rollback smoke" \
   "${ROOT_DIR}/wait-release/tests/install-agent-smoke.sh"
+run_step "installers: wait installer agent-uninstall menu convergence smoke" \
+  "${ROOT_DIR}/wait-release/tests/install-wait-smoke.sh"
 
 # Preserve the selected PATH/toolchain in subprocesses (review-2026-09-20 R11).
 # Backend (wait-main)

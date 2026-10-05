@@ -20,11 +20,17 @@ jndWyXnh3jM+TWNVvBarlcPGAEDxmIQAAYel8QIDJgzIs7xSKE9oLtvmmg==
 
 SYSTEMD_DIR="/etc/systemd/system"
 PROC_ROOT="/proc"
+# 老版本部署残留目录：老 agent 的 netstatic 状态/配置目录（含 net_static.json）。
+# 仅在卸载时删除，安装流程不再创建任何 /var/lib、/etc 目录。
+AGENT_DATA_DIR="/var/lib/wait-agent"
+LEGACY_ETC_DIR="/etc/wait-agent"
 HEALTH_ATTEMPTS=15
 HEALTH_POLL_INTERVAL=1
 if [[ "$INSTALLER_TEST_MODE" == "1" ]]; then
     SYSTEMD_DIR="${WAIT_AGENT_INSTALLER_SYSTEMD_DIR:-$SYSTEMD_DIR}"
     PROC_ROOT="${WAIT_AGENT_INSTALLER_PROC_ROOT:-$PROC_ROOT}"
+    AGENT_DATA_DIR="${WAIT_AGENT_INSTALLER_AGENT_DATA_DIR:-$AGENT_DATA_DIR}"
+    LEGACY_ETC_DIR="${WAIT_AGENT_INSTALLER_LEGACY_ETC_DIR:-$LEGACY_ETC_DIR}"
     HEALTH_ATTEMPTS="${WAIT_AGENT_INSTALLER_HEALTH_ATTEMPTS:-$HEALTH_ATTEMPTS}"
     HEALTH_POLL_INTERVAL="${WAIT_AGENT_INSTALLER_HEALTH_POLL_INTERVAL:-$HEALTH_POLL_INTERVAL}"
 elif [[ "$INSTALLER_TEST_MODE" != "0" ]]; then
@@ -42,6 +48,12 @@ usage() {
 用法:
   $0 --endpoint <URL> (--token <TOKEN> | --token-stdin) [--install-dir <DIR>] [--install-service-name <NAME>]
   $0 --uninstall [--install-dir <DIR>] [--install-service-name <NAME>]
+
+卸载说明:
+  远程卸载通道已移除，--uninstall 是唯一的卸载入口，必须登录到节点本地以 root 执行。
+  自定义安装参数时须与安装时一致（--install-dir / --install-service-name）。
+  卸载会移除 systemd unit、安装目录整体（二进制、env、自更新产物）、老版本残留目录
+  （/var/lib/wait-agent、/etc/wait-agent）、系统用户 wait-agent，并 rotate journald 日志。
 EOF
 }
 
@@ -66,6 +78,7 @@ COMMIT_STARTED=0
 INSTALL_SUCCEEDED=0
 ROLLBACK_DONE=0
 INSTALL_DIR_CREATED=0
+AGENT_PROCESSES_REMAIN=0
 
 remove_if_set() {
     local path="$1"
@@ -480,6 +493,21 @@ write_staged_environment() {
 
 write_staged_service() {
     TMP_SERVICE_PATH="$(mktemp "${SYSTEMD_DIR}/.${SERVICE_NAME}.service.new.XXXXXX")"
+    # 沙箱模型：agent 是纯出站客户端（gRPC/WebSocket 到主控），采集只读 /proc、/sys
+    # （gopsutil host.Info、IOCounters 读 /proc/net/dev、温度读 /sys/class/hwmon）。
+    # 唯一落盘需求是自更新把 .prev/.pending_update/.update_state.json 写在二进制旁，
+    # 因此 ProtectSystem=strict 下 ReadWritePaths 只放开安装目录。
+    # 与主控 unit（install-wait.sh create_systemd_service）逐项对照的差异：
+    #   - 无 AmbientCapabilities：agent 不监听端口，不需要绑低端口能力；
+    #   - 额外收紧（主控 unit 没有的）：RestrictAddressFamilies、RestrictNamespaces、
+    #     SystemCallArchitectures=native、MemoryDenyWriteExecute。
+    #   - AF_NETLINK 必须保留：Go 标准库 net.Interfaces() 与 gopsutil
+    #     net.Connections()（TCP/UDP 连接计数）在 Linux 上走 rtnetlink/inet_diag
+    #     netlink 套接字（monitoring/unit/ip.go、monitoring/unit/net.go）。
+    #   - MemoryDenyWriteExecute 对 Go 运行时是安全的：Go 不做运行时代码生成（无 JIT），
+    #     发布产物为 Go + musl cgo，不依赖 W+X 映射。
+    #   - 旧指令在极老 systemd 上会被忽略并告警（unit 仍可运行），与主控 unit 的
+    #     LockPersonality 等既有指令同样的兼容前提。
     cat > "$TMP_SERVICE_PATH" << EOF
 [Unit]
 Description=Wait Agent Service
@@ -496,13 +524,17 @@ Group=${RUNTIME_GROUP}
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=full
+ProtectSystem=strict
 ProtectHome=true
 ProtectControlGroups=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 RestrictSUIDSGID=true
 LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=true
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=true
 ReadWritePaths=$(quote_unit_value "$INSTALL_DIR")
 
 [Install]
@@ -587,20 +619,134 @@ commit_installation() {
     wait_for_service_health
 }
 
+agent_processes_running() {
+    # pgrep 缺失或 wait-agent 用户不存在时按"无进程"处理，让文件清理继续；
+    # 删除系统账号有独立的更严格判断（见 remove_agent_account）。
+    command -v pgrep >/dev/null 2>&1 || return 1
+    id -u "$AGENT_USER" >/dev/null 2>&1 || return 1
+    pgrep -u "$AGENT_USER" >/dev/null 2>&1
+}
+
+wait_for_agent_stop() {
+    local attempt
+    for ((attempt = 1; attempt <= 5; attempt++)); do
+        if ! agent_processes_running; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+remove_install_tree() {
+    local dir="$1"
+    # INSTALL_DIR 来自命令行参数，整目录删除前加一层防呆：拒绝把顶层系统
+    # 目录本身当作安装目录删除（子目录不受影响，如 /opt/wait、/var/lib/wait2）。
+    case "$dir" in
+        / | /bin | /boot | /dev | /etc | /home | /lib | /lib32 | /lib64 | /media | /mnt | /opt | /proc | /root | /run | /sbin | /srv | /sys | /tmp | /usr | /var)
+            log_err "拒绝整目录删除受保护路径: $dir"
+            return 1
+            ;;
+    esac
+    rm -rf -- "$dir"
+}
+
+remove_agent_account() {
+    if [[ "$INSTALLER_TEST_MODE" == "1" ]]; then
+        return 0
+    fi
+    if ! id -u "$AGENT_USER" >/dev/null 2>&1; then
+        return 0
+    fi
+    if [[ "$AGENT_PROCESSES_REMAIN" == "1" ]]; then
+        log_err "仍有 ${AGENT_USER} 用户进程在运行，跳过删除服务账号；处理后可重跑卸载"
+        return 1
+    fi
+    if ! command -v userdel >/dev/null 2>&1; then
+        log_err "缺少 userdel 命令，服务账号 $AGENT_USER 未删除"
+        return 1
+    fi
+    if ! userdel "$AGENT_USER" >/dev/null 2>&1; then
+        log_err "删除服务账号失败: $AGENT_USER"
+        return 1
+    fi
+    # userdel 通常会一并删除同名主组（--user-group 创建的）；兜底清理残余组。
+    if command -v groupdel >/dev/null 2>&1 && getent group "$AGENT_USER" >/dev/null 2>&1; then
+        groupdel "$AGENT_USER" >/dev/null 2>&1 || true
+    fi
+    log_ok "已删除系统用户: $AGENT_USER"
+    return 0
+}
+
+clean_journal_logs() {
+    # 测试模式下跳过真实 journalctl 调用：smoke test 会走完整卸载流程，
+    # 不能在真实 systemd 机器上触碰宿主机 journal。
+    if [[ "$INSTALLER_TEST_MODE" == "1" ]]; then
+        return 0
+    fi
+    # journald 不支持按 unit 清理：journalctl(1) 的 --vacuum-size/--vacuum-time/
+    # --vacuum-files 只作用于归档日志文件（以文件为单位），且文档明确不能与
+    # --unit 过滤组合（对照 systemd 主线 journalctl(1) 手册）。因此默认只做
+    # --rotate，把本 unit 的条目翻出活动文件；无痕清理交给操作员二选一：
+    #   1) 默认：残留条目由机器全局保留策略接管；
+    #   2) 设置 WAIT_AGENT_JOURNAL_VACUUM_TIME（如 1s）时，卸载额外执行
+    #      journalctl --vacuum-time=<值>。注意这会按时间清理整机日志。
+    if ! command -v journalctl >/dev/null 2>&1; then
+        log_info "  未找到 journalctl，跳过日志清理"
+        return 0
+    fi
+    journalctl --rotate >/dev/null 2>&1 || true
+    local vacuum_time="${WAIT_AGENT_JOURNAL_VACUUM_TIME:-}"
+    if [[ -n "$vacuum_time" ]]; then
+        if journalctl --vacuum-time="$vacuum_time" >/dev/null 2>&1; then
+            log_ok "已按 --vacuum-time=${vacuum_time} 清理 journald 日志（整机范围）"
+        else
+            log_err "journalctl --vacuum-time=${vacuum_time} 执行失败，日志未清理"
+        fi
+    fi
+}
+
 uninstall_agent() {
-    AGENT_PATH="$INSTALL_DIR/agent"
+    AGENT_PATH="${INSTALL_DIR}/agent"
     SERVICE_FILE="${SYSTEMD_DIR}/${SERVICE_NAME}.service"
     ENV_FILE="${INSTALL_DIR}/${SERVICE_NAME}.env"
     SERVICE_UNIT="${SERVICE_NAME}.service"
+    AGENT_PROCESSES_REMAIN=0
 
     log_step "卸载 wait agent..."
     systemctl stop "$SERVICE_UNIT" >/dev/null 2>&1 || true
     systemctl disable "$SERVICE_UNIT" >/dev/null 2>&1 || true
-    rm -f "$SERVICE_FILE" "$AGENT_PATH" "$ENV_FILE"
+    if ! wait_for_agent_stop; then
+        AGENT_PROCESSES_REMAIN=1
+        log_err "仍有 agent 进程在运行，将继续清理文件，但不会删除服务账号"
+    fi
+
+    rm -f "$SERVICE_FILE"
     systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl reset-failed "$SERVICE_UNIT" >/dev/null 2>&1 || true
-    rmdir "$INSTALL_DIR" >/dev/null 2>&1 || true
-    log_ok "卸载完成"
+
+    # 整目录删除覆盖：二进制、env、自更新产物（.prev/.pending_update/.update_state.json）
+    # 以及落在安装目录的旧版 net_static.json。目录不存在时为幂等空操作。
+    if [[ -e "$INSTALL_DIR" ]] && ! remove_install_tree "$INSTALL_DIR"; then
+        return 1
+    fi
+
+    # 老版本部署残留（老 agent 的 netstatic 状态/配置目录，含 net_static.json）。
+    # 不存在时为幂等空操作；删除失败（如权限）只告警不中断，账号删除有独立返回值。
+    if [[ -e "$AGENT_DATA_DIR" ]]; then
+        rm -rf -- "$AGENT_DATA_DIR" 2>/dev/null || log_err "无法删除旧状态目录: $AGENT_DATA_DIR"
+    fi
+    if [[ -e "$LEGACY_ETC_DIR" ]]; then
+        rm -rf -- "$LEGACY_ETC_DIR" 2>/dev/null || log_err "无法删除旧配置目录: $LEGACY_ETC_DIR"
+    fi
+
+    if ! remove_agent_account; then
+        return 1
+    fi
+    clean_journal_logs
+
+    log_ok "卸载完成（幂等，可重复执行）"
+    return 0
 }
 
 ENDPOINT=""
@@ -642,7 +788,9 @@ validate_inputs
 preflight
 
 if [[ "$UNINSTALL" == "1" ]]; then
-    uninstall_agent
+    if ! uninstall_agent; then
+        exit 1
+    fi
     exit 0
 fi
 if [[ -z "$ENDPOINT" || -z "$TOKEN" ]]; then
